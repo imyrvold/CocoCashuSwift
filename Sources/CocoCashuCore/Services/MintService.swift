@@ -2,7 +2,7 @@
 import Foundation
 
 public protocol MintAPI: Sendable {
-  func requestMintQuote(mint: MintURL, amount: Int64) async throws -> (invoice: String, expiresAt: Date?)
+    func requestMintQuote(mint: MintURL, amount: Int64) async throws -> (invoice: String, expiresAt: Date?, quoteId: String?)
   func checkQuoteStatus(mint: MintURL, invoice: String) async throws -> QuoteStatus
   func requestTokens(mint: MintURL, for invoice: String) async throws -> [Proof]
   func melt(mint: MintURL, proofs: [Proof], amount: Int64, destination: String) async throws -> String
