@@ -5,7 +5,7 @@ public protocol MintAPI: Sendable {
     func requestMintQuote(mint: MintURL, amount: Int64) async throws -> (invoice: String, expiresAt: Date?, quoteId: String?)
   func checkQuoteStatus(mint: MintURL, invoice: String) async throws -> QuoteStatus
   func requestTokens(mint: MintURL, for invoice: String) async throws -> [Proof]
-  func melt(mint: MintURL, proofs: [Proof], amount: Int64, destination: String) async throws -> String
+  func melt(mint: MintURL, proofs: [Proof], amount: Int64, destination: String) async throws -> (preimage: String, change: [Proof]?)
 }
 
 public actor MintService {
@@ -33,8 +33,11 @@ public actor MintService {
   public func spend(amount: Int64, from mint: MintURL, to destination: String) async throws {
     let reserved = try await proofs.reserve(amount: amount, mint: mint)
     do {
-      _ = try await api.melt(mint: mint, proofs: reserved, amount: amount, destination: destination)
+      let res = try await api.melt(mint: mint, proofs: reserved, amount: amount, destination: destination)
       try await proofs.markSpent(reserved.map(\.id), mint: mint)
+      if let change = res.change, !change.isEmpty {
+        try await proofs.addNew(change)
+      }
     } catch {
       // TODO: implement unreserve if melt fails and reservation expired
       throw error
