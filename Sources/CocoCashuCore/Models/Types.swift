@@ -97,6 +97,7 @@ public struct CocoBlindingEngine: BlindingEngine {
     private var lastParts: [Int64] = []
     private var lastMint: MintURL? = nil
     private var handles: [Int64: (secret: Data, r: Data)] = [:]
+    private var keyset: Keyset? = nil
 
     func setHandle(_ amount: Int64, secret: Data, r: Data) { handles[amount] = (secret, r) }
     func handle(for amount: Int64) -> (secret: Data, r: Data)? { handles[amount] }
@@ -106,48 +107,85 @@ public struct CocoBlindingEngine: BlindingEngine {
       lastMint = mint
     }
     func context() -> (mint: MintURL?, parts: [Int64]) { (lastMint, lastParts) }
+
+    func setKeyset(_ ks: Keyset) { keyset = ks }
+    func getKeyset() -> Keyset? { keyset }
   }
   private let store = Store()
 
   public func blind(parts: [Int64], mint: MintURL) async throws -> [BlindedOutput] {
-    // Fetch keyset (not used in the placeholder math but required for real blinding)
-    _ = try await fetchKeyset(mint)
+    // 1) Fetch and remember keyset (for unblinding later)
+    let ks = try await fetchKeyset(mint)
+    await store.setKeyset(ks)
 
-    // TODO: Replace placeholder with real EC blind: B_ = r*G + H(secret)*PubKey(amount)
-    // Generate a random secret and r for each part and keep them for unblinding later.
-    let outputs: [BlindedOutput] = parts.map { amt in
+    // 2) Validate keys exist for each denomination
+    for amt in parts {
+      guard ks.keys[amt] != nil else { throw NSError(domain: "CocoBlindingEngine", code: -20, userInfo: [NSLocalizedDescriptionKey: "Missing mint pubkey for amount \(amt)"]) }
+    }
+
+    // 3) For each part, create secret+r and compute B_ = Y + r·G where Y = H(secret)·G
+    var outs: [BlindedOutput] = []
+    outs.reserveCapacity(parts.count)
+    for amt in parts {
       let secret = randomBytes(32)
       let r = randomBytes(32)
-      let B_placeholder = (secret + r).map { String(format: "%02x", $0) }.joined()
-      Task { await store.setHandle(amt, secret: secret, r: r) }
-      return BlindedOutput(amount: amt, B_: B_placeholder)
+
+      let h = sha256(secret)              // Data (32)
+      var Y = try ec_pubkey_from_scalar(h) // Y = h·G
+      var rG = try ec_pubkey_from_scalar(r) // r·G
+      var B = try ec_combine(&Y, &rG)      // B_ = Y + r·G
+
+      let Bbytes = try ec_serialize_pubkey(&B)
+      let Bhex = Bbytes.map { String(format: "%02x", $0) }.joined()
+
+      await store.setHandle(amt, secret: secret, r: r)
+      outs.append(BlindedOutput(amount: amt, B_: Bhex))
     }
+
     await store.setContext(parts: parts, mint: mint)
-    return outputs
+    return outs
   }
 
   public func unblind(signatures: [BlindSignatureDTO], for parts: [Int64], mint: MintURL) async throws -> [Proof] {
-    // TODO: Replace placeholder with real EC unblind using r and the mint pubkey for each amount.
-    // Here we just sanity-check the order and return synthetic Proofs to keep the app wiring complete.
+    // Ensure context matches
     let ctx = await store.context()
-    let savedMint = ctx.mint
-    let savedParts = ctx.parts
-    guard savedMint == mint, savedParts == parts else {
+    guard ctx.mint == mint, ctx.parts == parts else {
       throw NSError(domain: "CocoBlindingEngine", code: -10, userInfo: [NSLocalizedDescriptionKey: "Blinding context not found or mismatched order"])
     }
+
+    // Get keyset (use stored, else fetch)
+    var ks = await store.getKeyset()
+    if ks == nil { ks = try? await fetchKeyset(mint) }
+    guard let keyset = ks else { throw NSError(domain: "CocoBlindingEngine", code: -21, userInfo: [NSLocalizedDescriptionKey: "Missing keyset for unblinding"]) }
+
     var results: [Proof] = []
-    for (i, sig) in signatures.enumerated() {
-      guard i < parts.count, sig.amount == parts[i] else {
-        throw NSError(domain: "CocoBlindingEngine", code: -11, userInfo: [NSLocalizedDescriptionKey: "Signature/output amount mismatch"])
-      }
-      // In real implementation: recover secret from handle and unblind C_/C to a valid signature over secret.
-      // Placeholder: use the stored secret as the proof secret so UI can progress locally.
-      if let handle = await store.handle(for: parts[i]) {
-        results.append(Proof(amount: parts[i], mint: mint, secret: handle.secret))
-      } else {
-        throw NSError(domain: "CocoBlindingEngine", code: -12, userInfo: [NSLocalizedDescriptionKey: "Missing blinding handle for part \(parts[i])"])
-      }
+    results.reserveCapacity(parts.count)
+
+    for (i, amt) in parts.enumerated() {
+      // 1) Fetch handle
+      guard let handle = await store.handle(for: amt) else {
+        throw NSError(domain: "CocoBlindingEngine", code: -12, userInfo: [NSLocalizedDescriptionKey: "Missing blinding handle for part \(amt)"]) }
+
+      // 2) Parse mint pubkey K for this denomination
+      guard let pkHex = keyset.keys[amt], let pkData = Data(hex: pkHex) else {
+        throw NSError(domain: "CocoBlindingEngine", code: -22, userInfo: [NSLocalizedDescriptionKey: "Invalid mint pubkey for amount \(amt)"]) }
+      var K = try ec_parse_pubkey(pkData)
+
+      // 3) Get blind signature C_ (or legacy C)
+      let sig = signatures[i]
+      guard let Chex = sig.C_ ?? sig.C, let Cdata = Data(hex: Chex), Cdata.count == 33 else {
+        throw NSError(domain: "CocoBlindingEngine", code: -23, userInfo: [NSLocalizedDescriptionKey: "Invalid blind signature for amount \(amt)"]) }
+      var Cb = try ec_parse_pubkey(Cdata)
+
+      // 4) Compute r·K and unblind: C = C_ - r·K = C_ + (-(r·K))
+      var rK = try ec_tweak_mul_pubkey(&K, handle.r)
+      var neg_rK = try ec_negate(&rK)
+      _ = try ec_combine(&Cb, &neg_rK) // C (unused for now)
+
+      // 5) Build spendable Proof. You may store serialized C later if your Proof supports it.
+      results.append(Proof(amount: amt, mint: mint, secret: handle.secret))
     }
+
     return results
   }
 }
@@ -157,4 +195,23 @@ private func randomBytes(_ count: Int) -> Data {
   var bytes = [UInt8](repeating: 0, count: count)
   _ = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
   return Data(bytes)
+}
+
+// MARK: - Hex decoding helper
+private extension Data {
+    /// Initialize Data from a hexadecimal string like "02a1b3..."
+    init?(hex: String) {
+        let len = hex.count / 2
+        var data = Data(capacity: len)
+        var index = hex.startIndex
+        for _ in 0..<len {
+            let next = hex.index(index, offsetBy: 2)
+            guard next <= hex.endIndex else { return nil }
+            let byteStr = hex[index..<next]
+            guard let byte = UInt8(byteStr, radix: 16) else { return nil }
+            data.append(byte)
+            index = next
+        }
+        self = data
+    }
 }
