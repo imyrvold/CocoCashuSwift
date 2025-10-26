@@ -35,6 +35,8 @@ public final class ObservableWallet {
       else { quotes.append(q) }
     case .mintSynced:
       break
+    case .quoteExecuted:
+        break
     }
   }
 }

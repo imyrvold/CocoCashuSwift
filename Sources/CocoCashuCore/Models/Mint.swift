@@ -9,3 +9,4 @@ public struct Mint: Codable, Sendable, Identifiable, Hashable {
     self.base = base; self.name = name
   }
 }
+

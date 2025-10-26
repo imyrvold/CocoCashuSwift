@@ -4,6 +4,7 @@ import Foundation
 public enum WalletEvent: Sendable {
   case proofsUpdated(mint: MintURL)
   case quoteUpdated(Quote)
+  case quoteExecuted(QuoteId)
   case mintSynced(MintURL)
 }
 

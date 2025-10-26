@@ -10,3 +10,4 @@ public struct Token: Codable, Sendable, Identifiable, Hashable {
     self.id = id; self.mint = mint; self.amount = amount; self.proofs = proofs
   }
 }
+
