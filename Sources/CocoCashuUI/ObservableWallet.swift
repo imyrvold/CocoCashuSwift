@@ -39,4 +39,22 @@ public final class ObservableWallet {
         break
     }
   }
+    
+    // MARK: - Manual refresh helpers
+    public func refreshAll() async {
+      // Refresh all mints currently shown in the UI
+      let knownMints = proofsByMint.keys.compactMap { URL(string: $0) }
+      for mint in knownMints {
+        if let arr = try? await manager.proofService.availableProofs(mint: mint) {
+          proofsByMint[mint.absoluteString] = arr
+        }
+      }
+    }
+
+    public func refresh(mint: URL) async {
+      if let arr = try? await manager.proofService.availableProofs(mint: mint) {
+        proofsByMint[mint.absoluteString] = arr
+      }
+    }
+    
 }
