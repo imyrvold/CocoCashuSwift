@@ -1,7 +1,9 @@
 struct WalletStoredProof: Codable {
-  let amount: Int64
-  let mint: String
-  let secretBase64: String
+    let amount: Int64
+    let mint: String
+    let secretBase64: String
+    let C: String
+    let keysetId: String
 }
 
 // ObservableWallet.swift
@@ -70,7 +72,9 @@ public final class ObservableWallet {
           WalletStoredProof(
             amount: proof.amount,
             mint: mintStr,
-            secretBase64: proof.secret.base64EncodedString()
+            secretBase64: proof.secret.base64EncodedString(),
+            C: proof.C,
+            keysetId: proof.keysetId
           )
         }
       }

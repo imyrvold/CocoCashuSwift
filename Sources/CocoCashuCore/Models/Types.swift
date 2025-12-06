@@ -1,4 +1,6 @@
 import Foundation
+import secp256k1_bindings
+import CryptoKit
 
 public typealias MintURL = URL
 public typealias ProofId = UUID
@@ -67,127 +69,165 @@ public struct Keyset: Codable, Sendable, Hashable {
 /// A configurable blinding engine that you can back with CocoCashuCore’s crypto.
 /// This scaffolding compiles and handles output planning; wire the two TODOs to finish NUT-04.
 public struct CocoBlindingEngine: BlindingEngine {
-  public typealias KeysetFetcher = @Sendable (MintURL) async throws -> Keyset
-
-  private let fetchKeyset: KeysetFetcher
-
-  /// Create with a closure that fetches the current keyset for a mint (e.g. RealMintAPI /v1/keys)
-  public init(fetchKeyset: @escaping KeysetFetcher) {
-    self.fetchKeyset = fetchKeyset
-  }
-
-  /// Simple power-of-two split (e.g., 10 -> [8,2]). Replace if you have a smarter splitter.
-  public func planOutputs(amount: Int64, mint: MintURL) async throws -> [Int64] {
-    precondition(amount > 0, "amount must be > 0")
-    var x = amount
-    var parts: [Int64] = []
-    var p: Int64 = 1
-    while p <= x { p <<= 1 }
-    p >>= 1
-    while x > 0 {
-      if p <= x { parts.append(p); x -= p }
-      p >>= 1
+    public typealias KeysetFetcher = @Sendable (MintURL) async throws -> Keyset
+    
+    private let fetchKeyset: KeysetFetcher
+    
+    /// Create with a closure that fetches the current keyset for a mint (e.g. RealMintAPI /v1/keys)
+    public init(fetchKeyset: @escaping KeysetFetcher) {
+        self.fetchKeyset = fetchKeyset
     }
-    return parts
-  }
-
-  // Storage for blinding handles (secrets/r) keyed by (mint, amount) order for this session.
-  // In a production engine you’d persist per-quote context to guarantee order matching.
-  private actor Store {
-    private var lastParts: [Int64] = []
-    private var lastMint: MintURL? = nil
-    private var handles: [Int64: (secret: Data, r: Data)] = [:]
-    private var keyset: Keyset? = nil
-
-    func setHandle(_ amount: Int64, secret: Data, r: Data) { handles[amount] = (secret, r) }
-    func handle(for amount: Int64) -> (secret: Data, r: Data)? { handles[amount] }
-
-    func setContext(parts: [Int64], mint: MintURL) {
-      lastParts = parts
-      lastMint = mint
+    
+    /// Simple power-of-two split (e.g., 10 -> [8,2]). Replace if you have a smarter splitter.
+    public func planOutputs(amount: Int64, mint: MintURL) async throws -> [Int64] {
+        precondition(amount > 0, "amount must be > 0")
+        var x = amount
+        var parts: [Int64] = []
+        var p: Int64 = 1
+        while p <= x { p <<= 1 }
+        p >>= 1
+        while x > 0 {
+            if p <= x { parts.append(p); x -= p }
+            p >>= 1
+        }
+        return parts
     }
-    func context() -> (mint: MintURL?, parts: [Int64]) { (lastMint, lastParts) }
-
-    func setKeyset(_ ks: Keyset) { keyset = ks }
-    func getKeyset() -> Keyset? { keyset }
-  }
-  private let store = Store()
-
-  public func blind(parts: [Int64], mint: MintURL) async throws -> [BlindedOutput] {
-    // 1) Fetch and remember keyset (for unblinding later)
-    let ks = try await fetchKeyset(mint)
-    await store.setKeyset(ks)
-
-    // 2) Validate keys exist for each denomination
-    for amt in parts {
-      guard ks.keys[amt] != nil else { throw NSError(domain: "CocoBlindingEngine", code: -20, userInfo: [NSLocalizedDescriptionKey: "Missing mint pubkey for amount \(amt)"]) }
+    
+    // Storage for blinding handles (secrets/r) keyed by (mint, amount) order for this session.
+    // In a production engine you’d persist per-quote context to guarantee order matching.
+    private actor Store {
+        private var lastParts: [Int64] = []
+        private var lastMint: MintURL? = nil
+        private var handles: [Int64: (secret: Data, r: Data)] = [:]
+        private var keyset: Keyset? = nil
+        
+        func setHandle(_ amount: Int64, secret: Data, r: Data) { handles[amount] = (secret, r) }
+        func handle(for amount: Int64) -> (secret: Data, r: Data)? { handles[amount] }
+        
+        func setContext(parts: [Int64], mint: MintURL) {
+            lastParts = parts
+            lastMint = mint
+        }
+        func context() -> (mint: MintURL?, parts: [Int64]) { (lastMint, lastParts) }
+        
+        func setKeyset(_ ks: Keyset) { keyset = ks }
+        func getKeyset() -> Keyset? { keyset }
     }
-
-    // 3) For each part, create secret+r and compute B_ = Y + r·G where Y = H(secret)·G
-    var outs: [BlindedOutput] = []
-    outs.reserveCapacity(parts.count)
-    for amt in parts {
-      let secret = randomBytes(32)
-      let r = randomBytes(32)
-
-      let h = sha256(secret)              // Data (32)
-      var Y = try ec_pubkey_from_scalar(h) // Y = h·G
-      var rG = try ec_pubkey_from_scalar(r) // r·G
-      var B = try ec_combine(&Y, &rG)      // B_ = Y + r·G
-
-      let Bbytes = try ec_serialize_pubkey(&B)
-      let Bhex = Bbytes.map { String(format: "%02x", $0) }.joined()
-
-      await store.setHandle(amt, secret: secret, r: r)
-      outs.append(BlindedOutput(amount: amt, B_: Bhex))
+    private let store = Store()
+    
+    public func blind(parts: [Int64], mint: MintURL) async throws -> [BlindedOutput] {
+        // 1) Fetch and remember keyset (for unblinding later)
+        let ks = try await fetchKeyset(mint)
+        await store.setKeyset(ks)
+        
+        // 2) Validate keys exist for each denomination
+        for amt in parts {
+            guard ks.keys[amt] != nil else { throw NSError(domain: "CocoBlindingEngine", code: -20, userInfo: [NSLocalizedDescriptionKey: "Missing mint pubkey for amount \(amt)"]) }
+        }
+        
+        // 3) For each part, create secret+r and compute B_ = Y + r·G where Y = H(secret)·G
+        var outs: [BlindedOutput] = []
+        outs.reserveCapacity(parts.count)
+        for amt in parts {
+            let secret = randomBytes(32)
+            let r = randomBytes(32)
+            
+            let secretHex = secret.map { String(format: "%02x", $0) }.joined()
+            print("DEBUG BLIND: Secret Hex: \(secretHex)")
+            guard let initialData = secretHex.data(using: .utf8) else { continue }
+            
+            var Y: secp256k1_pubkey? = nil
+            var currentHash = sha256(initialData)
+            
+            while Y == nil {
+                // Construct 33 bytes: [0x02] + [32-byte hash]
+                var attemptBytes = Data([0x02]) + currentHash
+                do {
+                    // Try to parse this as a valid public key
+                    Y = try ec_parse_pubkey(attemptBytes)
+                } catch {
+                    // If invalid X-coordinate, hash the hash and try again
+                    currentHash = sha256(currentHash)
+                }
+            }
+            
+            var Y_point = Y!
+            var rG = try ec_pubkey_from_scalar(r)
+            var B = try ec_combine(&Y_point, &rG)
+            
+            let Bbytes = try ec_serialize_pubkey(&B)
+            let Bhex = Bbytes.map { String(format: "%02x", $0) }.joined()
+            
+            await store.setHandle(amt, secret: secret, r: r)
+            outs.append(BlindedOutput(amount: amt, B_: Bhex))
+        }
+        
+        await store.setContext(parts: parts, mint: mint)
+        return outs
     }
-
-    await store.setContext(parts: parts, mint: mint)
-    return outs
-  }
-
-  public func unblind(signatures: [BlindSignatureDTO], for parts: [Int64], mint: MintURL) async throws -> [Proof] {
-    // Ensure context matches
-    let ctx = await store.context()
-    guard ctx.mint == mint, ctx.parts == parts else {
-      throw NSError(domain: "CocoBlindingEngine", code: -10, userInfo: [NSLocalizedDescriptionKey: "Blinding context not found or mismatched order"])
+    
+    public func unblind(signatures: [BlindSignatureDTO], for parts: [Int64], mint: MintURL) async throws -> [Proof] {
+        // Ensure context matches
+        let ctx = await store.context()
+        guard ctx.mint == mint, ctx.parts == parts else {
+            throw NSError(domain: "CocoBlindingEngine", code: -10, userInfo: [NSLocalizedDescriptionKey: "Blinding context not found or mismatched order"])
+        }
+        
+        // Get keyset
+        var ks = await store.getKeyset()
+        if ks == nil { ks = try? await fetchKeyset(mint) }
+        guard let keyset = ks else { throw NSError(domain: "CocoBlindingEngine", code: -21, userInfo: [NSLocalizedDescriptionKey: "Missing keyset for unblinding"]) }
+        
+        var results: [Proof] = []
+        results.reserveCapacity(parts.count)
+        
+        for amt in parts {
+            // 1) Fetch handle (r, secret)
+            guard let handle = await store.handle(for: amt) else {
+                throw NSError(domain: "CocoBlindingEngine", code: -12, userInfo: [NSLocalizedDescriptionKey: "Missing blinding handle for part \(amt)"])
+            }
+            
+            // 2) Parse mint pubkey K for this denomination
+            guard let pkHex = keyset.keys[amt], let pkData = Data(hex: pkHex) else {
+                throw NSError(domain: "CocoBlindingEngine", code: -22, userInfo: [NSLocalizedDescriptionKey: "Invalid mint pubkey for amount \(amt)"])
+            }
+            var K = try ec_parse_pubkey(pkData)
+            
+            // 3) Find the matching signature for this amount
+            // FIX: Search by amount instead of using index 'i'
+            guard let sig = signatures.first(where: { $0.amount == amt }) else {
+                throw NSError(domain: "CocoBlindingEngine", code: -24, userInfo: [NSLocalizedDescriptionKey: "Mint did not return a signature for amount \(amt)"])
+            }
+            
+            // 4) Parse C_ (Blind Signature)
+            guard let Chex = sig.C_ ?? sig.C, let Cdata = Data(hex: Chex), Cdata.count == 33 else {
+                throw NSError(domain: "CocoBlindingEngine", code: -23, userInfo: [NSLocalizedDescriptionKey: "Invalid blind signature for amount \(amt)"])
+            }
+            var C_blinded = try ec_parse_pubkey(Cdata)
+            
+            // 5) Unblind: C = C_ - rK
+            var rK = try ec_tweak_mul_pubkey(&K, handle.r)
+            var neg_rK = try ec_negate(&rK)
+            
+            // Assign result to variable
+            var C_unblinded = try ec_combine(&C_blinded, &neg_rK)
+            
+            // Serialize C to hex
+            let C_bytes = try ec_serialize_pubkey(&C_unblinded)
+            let C_hex = C_bytes.map { String(format: "%02x", $0) }.joined()
+            
+            // 6) Build spendable Proof
+            results.append(Proof(
+                amount: amt,
+                mint: mint,
+                secret: handle.secret,
+                C: C_hex,
+                keysetId: keyset.id
+            ))
+        }
+        
+        return results
     }
-
-    // Get keyset (use stored, else fetch)
-    var ks = await store.getKeyset()
-    if ks == nil { ks = try? await fetchKeyset(mint) }
-    guard let keyset = ks else { throw NSError(domain: "CocoBlindingEngine", code: -21, userInfo: [NSLocalizedDescriptionKey: "Missing keyset for unblinding"]) }
-
-    var results: [Proof] = []
-    results.reserveCapacity(parts.count)
-
-    for (i, amt) in parts.enumerated() {
-      // 1) Fetch handle
-      guard let handle = await store.handle(for: amt) else {
-        throw NSError(domain: "CocoBlindingEngine", code: -12, userInfo: [NSLocalizedDescriptionKey: "Missing blinding handle for part \(amt)"]) }
-
-      // 2) Parse mint pubkey K for this denomination
-      guard let pkHex = keyset.keys[amt], let pkData = Data(hex: pkHex) else {
-        throw NSError(domain: "CocoBlindingEngine", code: -22, userInfo: [NSLocalizedDescriptionKey: "Invalid mint pubkey for amount \(amt)"]) }
-      var K = try ec_parse_pubkey(pkData)
-
-      // 3) Get blind signature C_ (or legacy C)
-      let sig = signatures[i]
-      guard let Chex = sig.C_ ?? sig.C, let Cdata = Data(hex: Chex), Cdata.count == 33 else {
-        throw NSError(domain: "CocoBlindingEngine", code: -23, userInfo: [NSLocalizedDescriptionKey: "Invalid blind signature for amount \(amt)"]) }
-      var Cb = try ec_parse_pubkey(Cdata)
-
-      // 4) Compute r·K and unblind: C = C_ - r·K = C_ + (-(r·K))
-      var rK = try ec_tweak_mul_pubkey(&K, handle.r)
-      var neg_rK = try ec_negate(&rK)
-      _ = try ec_combine(&Cb, &neg_rK) // C (unused for now)
-
-      // 5) Build spendable Proof. You may store serialized C later if your Proof supports it.
-      results.append(Proof(amount: amt, mint: mint, secret: handle.secret))
-    }
-
-    return results
-  }
 }
 
 // MARK: - Small helpers

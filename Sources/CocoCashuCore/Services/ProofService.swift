@@ -58,9 +58,16 @@ public actor ProofService {
     // 3) Create local change proof if needed (total - amount)
     let change = total - amount
     if change > 0 {
-      let changeProof = Proof(amount: change, mint: mint, secret: Data())
+      let changeProof = Proof(amount: change, mint: mint, secret: Data(), C: "", keysetId: "")
       try await proofs.insert(changeProof)
       events.emit(.proofsUpdated(mint: mint))
     }
   }
+    
+    /// Unreserves proofs, making them available for spending again immediately.
+      public func unreserve(_ ids: [ProofId], mint: MintURL) async throws {
+        try await proofs.updateState(ids: ids, to: .unspent)
+        events.emit(.proofsUpdated(mint: mint))
+      }
+    
 }
