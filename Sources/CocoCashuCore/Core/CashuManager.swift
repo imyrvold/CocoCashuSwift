@@ -19,13 +19,14 @@ public final class CashuManager: @unchecked Sendable {
     mintRepo: MintRepository,
     quoteRepo: QuoteRepository,
     counterRepo: CounterRepository,
-    api: MintAPI
+    api: MintAPI,
+    blinding: BlindingEngine
   ) {
     self.events = EventBus()
     let ps = ProofService(proofs: proofRepo, events: events)
     self.proofService = ps
     self.quoteService = QuoteService(quotes: quoteRepo, events: events)
-    self.mintService = MintService(mints: mintRepo, proofs: ps, events: events, api: api)
+    self.mintService = MintService(mints: mintRepo, proofs: ps, events: events, api: api, blinding: blinding)
   }
 
   public func use(_ plugin: CashuPlugin) async {

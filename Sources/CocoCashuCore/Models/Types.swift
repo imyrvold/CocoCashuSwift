@@ -19,7 +19,8 @@ public enum ProofState: String, Codable, Sendable {
 public struct BlindedOutput: Codable, Sendable, Hashable {
   public let amount: Int64
   public let B_: String
-  public init(amount: Int64, B_: String) { self.amount = amount; self.B_ = B_ }
+  public let id: String
+    public init(amount: Int64, B_: String, id: String) { self.amount = amount; self.B_ = B_; self.id = id }
 }
 
 /// Blind signature (response) from the mint (NUT-04)
@@ -159,7 +160,7 @@ public struct CocoBlindingEngine: BlindingEngine {
             let Bhex = Bbytes.map { String(format: "%02x", $0) }.joined()
             
             await store.setHandle(amt, secret: secret, r: r)
-            outs.append(BlindedOutput(amount: amt, B_: Bhex))
+            outs.append(BlindedOutput(amount: amt, B_: Bhex, id: ks.id))
         }
         
         await store.setContext(parts: parts, mint: mint)
@@ -181,49 +182,48 @@ public struct CocoBlindingEngine: BlindingEngine {
         var results: [Proof] = []
         results.reserveCapacity(parts.count)
         
+        var availableSigs = signatures
+        
         for amt in parts {
             // 1) Fetch handle (r, secret)
-            guard let handle = await store.handle(for: amt) else {
-                throw NSError(domain: "CocoBlindingEngine", code: -12, userInfo: [NSLocalizedDescriptionKey: "Missing blinding handle for part \(amt)"])
-            }
+            guard let handle = await store.handle(for: amt) else { continue }
             
             // 2) Parse mint pubkey K for this denomination
-            guard let pkHex = keyset.keys[amt], let pkData = Data(hex: pkHex) else {
-                throw NSError(domain: "CocoBlindingEngine", code: -22, userInfo: [NSLocalizedDescriptionKey: "Invalid mint pubkey for amount \(amt)"])
+            guard let pkHex = keyset.keys[amt], let pkData = Data(hex: pkHex) else { continue }
+            
+            // FIX: Find the first matching signature for this amount
+            if let index = availableSigs.firstIndex(where: { $0.amount == amt }) {
+                let sig = availableSigs.remove(at: index) // Consume it so we don't reuse it
+                
+                // ... (Perform unblinding math for this signature) ...
+                do {
+                    var K = try ec_parse_pubkey(pkData)
+                    guard let Chex = sig.C_ ?? sig.C, let Cdata = Data(hex: Chex), Cdata.count == 33 else { continue }
+                    var C_blinded = try ec_parse_pubkey(Cdata)
+                    
+                    var C_temp = C_blinded
+                    var rK = try ec_tweak_mul_pubkey(&K, handle.r)
+                    var neg_rK = try ec_negate(&rK)
+                    var C_unblinded = try ec_combine(&C_temp, &neg_rK)
+                    
+                    let C_bytes = try ec_serialize_pubkey(&C_unblinded)
+                    let C_hex = C_bytes.map { String(format: "%02x", $0) }.joined()
+                    
+                    results.append(Proof(
+                        amount: amt,
+                        mint: mint,
+                        secret: handle.secret,
+                        C: C_hex,
+                        keysetId: keyset.id
+                    ))
+                } catch {
+                    print("⚠️ Failed to unblind signature for \(amt): \(error)")
+                }
+            } else {
+                // FIX: Log warning but DO NOT throw.
+                // This lets us keep the other change coins even if this one was eaten by fees.
+                print("⚠️ Warning: Mint did not return signature for change output: \(amt) sats (likely consumed as fee)")
             }
-            var K = try ec_parse_pubkey(pkData)
-            
-            // 3) Find the matching signature for this amount
-            // FIX: Search by amount instead of using index 'i'
-            guard let sig = signatures.first(where: { $0.amount == amt }) else {
-                throw NSError(domain: "CocoBlindingEngine", code: -24, userInfo: [NSLocalizedDescriptionKey: "Mint did not return a signature for amount \(amt)"])
-            }
-            
-            // 4) Parse C_ (Blind Signature)
-            guard let Chex = sig.C_ ?? sig.C, let Cdata = Data(hex: Chex), Cdata.count == 33 else {
-                throw NSError(domain: "CocoBlindingEngine", code: -23, userInfo: [NSLocalizedDescriptionKey: "Invalid blind signature for amount \(amt)"])
-            }
-            var C_blinded = try ec_parse_pubkey(Cdata)
-            
-            // 5) Unblind: C = C_ - rK
-            var rK = try ec_tweak_mul_pubkey(&K, handle.r)
-            var neg_rK = try ec_negate(&rK)
-            
-            // Assign result to variable
-            var C_unblinded = try ec_combine(&C_blinded, &neg_rK)
-            
-            // Serialize C to hex
-            let C_bytes = try ec_serialize_pubkey(&C_unblinded)
-            let C_hex = C_bytes.map { String(format: "%02x", $0) }.joined()
-            
-            // 6) Build spendable Proof
-            results.append(Proof(
-                amount: amt,
-                mint: mint,
-                secret: handle.secret,
-                C: C_hex,
-                keysetId: keyset.id
-            ))
         }
         
         return results

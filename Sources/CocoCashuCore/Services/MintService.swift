@@ -3,21 +3,23 @@ import Foundation
 
 public protocol MintAPI: Sendable {
     func requestMintQuote(mint: MintURL, amount: Int64) async throws -> (invoice: String, expiresAt: Date?, quoteId: String?)
-  func checkQuoteStatus(mint: MintURL, invoice: String) async throws -> QuoteStatus
-  func requestTokens(mint: MintURL, for invoice: String) async throws -> [Proof]
-  func melt(mint: MintURL, proofs: [Proof], amount: Int64, destination: String) async throws -> (preimage: String, change: [Proof]?)
+    func checkQuoteStatus(mint: MintURL, invoice: String) async throws -> QuoteStatus
+    func requestTokens(mint: MintURL, for invoice: String) async throws -> [Proof]
+    func requestMeltQuote(mint: MintURL, amount: Int64, destination: String) async throws -> (quoteId: String, feeReserve: Int64)
+    func executeMelt(mint: MintURL, quoteId: String, inputs: [Proof], outputs: [BlindedOutput]) async throws -> (preimage: String, change: [BlindSignatureDTO]?)
+
 }
 
 public actor MintService {
-  private let mints: MintRepository
-  private let proofs: ProofService
-  private let events: EventBus
-  private let api: MintAPI
+    private let mints: MintRepository
+    private let proofs: ProofService
+    private let events: EventBus
+    private let api: MintAPI
+    private let blinding: BlindingEngine
 
-  public init(mints: MintRepository, proofs: ProofService, events: EventBus, api: MintAPI) {
-    self.mints = mints; self.proofs = proofs; self.events = events; self.api = api
-  }
-
+    public init(mints: MintRepository, proofs: ProofService, events: EventBus, api: MintAPI, blinding: BlindingEngine) {
+        self.mints = mints; self.proofs = proofs; self.events = events; self.api = api; self.blinding = blinding
+    }
   public func syncMints() async throws {
     // hook for fetching/updating mint metadata if needed
     for mint in try await mints.fetchAll() { events.emit(.mintSynced(mint.base)) }
@@ -29,29 +31,46 @@ public actor MintService {
     try await proofs.addNew(newProofs)
   }
 
-  /// Spend tokens (melt) to a destination (e.g., bolt11 invoice)
-  public func spend(amount: Int64, from mint: MintURL, to destination: String) async throws {
-      let feeBuffer = max(2, Int64(Double(amount) * 0.02))
-        let totalNeeded = amount + feeBuffer
+    /// Spend tokens (melt) with Change handling
+    public func spend(amount: Int64, from mint: MintURL, to destination: String) async throws {
+        // 1. Get Quote & Fee Reserve from Mint
+        let (quoteId, feeReserve) = try await api.requestMeltQuote(mint: mint, amount: amount, destination: destination)
         
-        // Reserve the total amount (invoice + buffer)
-        let reserved = try await proofs.reserve(amount: totalNeeded, mint: mint)
+        // 2. Select Inputs to cover Amount + Fee
+        let totalNeeded = amount + feeReserve
+        let inputs = try await proofs.reserve(amount: totalNeeded, mint: mint)
         
         do {
-          // Send all reserved proofs. The mint will melt 'amount' and return the rest as new tokens (change).
-          let res = try await api.melt(mint: mint, proofs: reserved, amount: amount, destination: destination)
-          
-          // Mark the input proofs as spent
-          try await proofs.markSpent(reserved.map(\.id), mint: mint)
-          
-          // Add the change proofs back to the wallet
-          if let change = res.change, !change.isEmpty {
-            try await proofs.addNew(change)
-          }
+            // 3. Calculate Change (Input - Needed)
+            let totalInput = inputs.map(\.amount).reduce(0, +)
+            let changeAmt = totalInput - totalNeeded
+            
+            // 4. Blind the Change (if any)
+            let outputs: [BlindedOutput]
+            var changeParts: [Int64] = []
+            if changeAmt > 0 {
+                changeParts = try await blinding.planOutputs(amount: changeAmt, mint: mint)
+                outputs = try await blinding.blind(parts: changeParts, mint: mint)
+            } else {
+                outputs = []
+            }
+            
+            // 5. Execute Melt (Send Inputs + Blinded Change)
+            let (preimage, changeSigs) = try await api.executeMelt(mint: mint, quoteId: quoteId, inputs: inputs, outputs: outputs)
+            
+            // 6. Unblind Change Signatures into Proofs
+            if let sigs = changeSigs, !sigs.isEmpty, !changeParts.isEmpty {
+                let changeProofs = try await blinding.unblind(signatures: sigs, for: changeParts, mint: mint)
+                try await proofs.addNew(changeProofs)
+            }
+            
+            // 7. Mark Inputs as Spent
+            try await proofs.markSpent(inputs.map(\.id), mint: mint)
+            
         } catch {
-          // If it fails, unreserve the proofs so they don't get stuck
-          try? await proofs.unreserve(reserved.map(\.id), mint: mint)
-          throw error
+            // Unreserve if failed
+            try? await proofs.unreserve(inputs.map(\.id), mint: mint)
+            throw error
         }
-  }
+    }
 }
