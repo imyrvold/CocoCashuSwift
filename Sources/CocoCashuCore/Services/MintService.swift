@@ -16,36 +16,44 @@ public actor MintService {
     private let events: EventBus
     private let api: MintAPI
     private let blinding: BlindingEngine
-
+    
     public init(mints: MintRepository, proofs: ProofService, events: EventBus, api: MintAPI, blinding: BlindingEngine) {
         self.mints = mints; self.proofs = proofs; self.events = events; self.api = api; self.blinding = blinding
     }
-  public func syncMints() async throws {
-    // hook for fetching/updating mint metadata if needed
-    for mint in try await mints.fetchAll() { events.emit(.mintSynced(mint.base)) }
-  }
-
-  /// After invoice is paid, fetch minted proofs (receive tokens).
-  public func receiveTokens(for quote: Quote) async throws {
-    let newProofs = try await api.requestTokens(mint: quote.mint, for: quote.invoice ?? "")
-    try await proofs.addNew(newProofs)
-  }
-
+    public func syncMints() async throws {
+        // hook for fetching/updating mint metadata if needed
+        for mint in try await mints.fetchAll() { events.emit(.mintSynced(mint.base)) }
+    }
+    
+    /// After invoice is paid, fetch minted proofs (receive tokens).
+    public func receiveTokens(for quote: Quote) async throws {
+        let newProofs = try await api.requestTokens(mint: quote.mint, for: quote.invoice ?? "")
+        try await proofs.addNew(newProofs)
+    }
+    
     /// Spend tokens (melt) with Change handling
     public func spend(amount: Int64, from mint: MintURL, to destination: String) async throws {
-        // 1. Get Quote & Fee Reserve from Mint
+        // 1. Get Quote & Fee Reserve
         let (quoteId, feeReserve) = try await api.requestMeltQuote(mint: mint, amount: amount, destination: destination)
         
-        // 2. Select Inputs to cover Amount + Fee
-        let totalNeeded = amount + feeReserve
-        let inputs = try await proofs.reserve(amount: totalNeeded, mint: mint)
+        // FIX: Add a small safety buffer (e.g., 3 sats) to handle fee spikes
+        let safetyBuffer: Int64 = 3
+        let estimatedNeeded = amount + feeReserve
+        
+        // 2. Reserve inputs covering the Amount + Fee + Buffer
+        // This ensures we satisfy the "Provided < Needed" check even if fees rise.
+        let inputs = try await proofs.reserve(amount: estimatedNeeded + safetyBuffer, mint: mint)
         
         do {
-            // 3. Calculate Change (Input - Needed)
+            // 3. Calculate Change
+            // We ask for everything back (Total Input - Estimated Cost).
+            // If the fee spikes, the Mint will consume part of this change, and our
+            // "missing signature" warning logic will handle the dropped change output gracefully.
             let totalInput = inputs.map(\.amount).reduce(0, +)
-            let changeAmt = totalInput - totalNeeded
+            let changeAmt = totalInput - estimatedNeeded
             
-            // 4. Blind the Change (if any)
+            // ... (The rest of the logic remains exactly the same) ...
+            
             let outputs: [BlindedOutput]
             var changeParts: [Int64] = []
             if changeAmt > 0 {
@@ -55,20 +63,16 @@ public actor MintService {
                 outputs = []
             }
             
-            // 5. Execute Melt (Send Inputs + Blinded Change)
             let (preimage, changeSigs) = try await api.executeMelt(mint: mint, quoteId: quoteId, inputs: inputs, outputs: outputs)
             
-            // 6. Unblind Change Signatures into Proofs
             if let sigs = changeSigs, !sigs.isEmpty, !changeParts.isEmpty {
                 let changeProofs = try await blinding.unblind(signatures: sigs, for: changeParts, mint: mint)
                 try await proofs.addNew(changeProofs)
             }
             
-            // 7. Mark Inputs as Spent
             try await proofs.markSpent(inputs.map(\.id), mint: mint)
             
         } catch {
-            // Unreserve if failed
             try? await proofs.unreserve(inputs.map(\.id), mint: mint)
             throw error
         }

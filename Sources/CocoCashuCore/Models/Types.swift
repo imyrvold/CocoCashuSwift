@@ -84,14 +84,16 @@ public struct CocoBlindingEngine: BlindingEngine {
         precondition(amount > 0, "amount must be > 0")
         var x = amount
         var parts: [Int64] = []
+        
         var p: Int64 = 1
         while p <= x { p <<= 1 }
         p >>= 1
+        
         while x > 0 {
             if p <= x { parts.append(p); x -= p }
             p >>= 1
         }
-        return parts
+        return parts.sorted()
     }
     
     // Storage for blinding handles (secrets/r) keyed by (mint, amount) order for this session.
