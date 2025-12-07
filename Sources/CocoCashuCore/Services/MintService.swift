@@ -16,9 +16,11 @@ public actor MintService {
     private let events: EventBus
     private let api: MintAPI
     private let blinding: BlindingEngine
+    private let history: HistoryService
     
-    public init(mints: MintRepository, proofs: ProofService, events: EventBus, api: MintAPI, blinding: BlindingEngine) {
+    public init(mints: MintRepository, proofs: ProofService, events: EventBus, api: MintAPI, blinding: BlindingEngine, history: HistoryService) {
         self.mints = mints; self.proofs = proofs; self.events = events; self.api = api; self.blinding = blinding
+        self.history = history
     }
     public func syncMints() async throws {
         // hook for fetching/updating mint metadata if needed
@@ -29,6 +31,9 @@ public actor MintService {
     public func receiveTokens(for quote: Quote) async throws {
         let newProofs = try await api.requestTokens(mint: quote.mint, for: quote.invoice ?? "")
         try await proofs.addNew(newProofs)
+        
+        let total = newProofs.map(\.amount).reduce(0, +)
+        await history.add(CashuTransaction(type: .mint, amount: total, memo: "Minted via Lightning", status: .success))
     }
     
     /// Spend tokens (melt) with Change handling
@@ -72,6 +77,12 @@ public actor MintService {
             
             try await proofs.markSpent(inputs.map(\.id), mint: mint)
             
+            // RECORD HISTORY
+                   // Fee is roughly (Inputs - Change - Sent Amount)
+            let totalChange = (changeSigs?.map(\.amount).reduce(0, +) ?? 0)
+            let actualFee = totalInput - totalChange - amount
+            
+            await history.add(CashuTransaction(type: .melt, amount: amount, fee: actualFee, memo: "Paid Lightning Invoice", status: .success))
         } catch {
             try? await proofs.unreserve(inputs.map(\.id), mint: mint)
             throw error

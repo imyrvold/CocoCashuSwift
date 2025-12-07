@@ -19,11 +19,14 @@ private final class WeakBox<T: AnyObject>: @unchecked Sendable { weak var value:
 public final class ObservableWallet {
   public private(set) var proofsByMint: [String: [Proof]] = [:]
   public private(set) var quotes: [Quote] = []
-
+  public private(set) var transactions: [CashuTransaction] = []
   public let manager: CashuManager
 
   public init(manager: CashuManager) {
     self.manager = manager
+      Task {
+          self.transactions = await manager.history.fetchAll()
+      }
     let box = WeakBox(self)
     manager.events.subscribe { event in
       Task { @MainActor in
@@ -34,6 +37,8 @@ public final class ObservableWallet {
 
   private func handle(_ event: WalletEvent) async {
     switch event {
+    case .historyUpdated:
+            self.transactions = await manager.history.fetchAll()
     case .proofsUpdated(let mint):
       if let arr = try? await manager.proofService.availableProofs(mint: mint) {
         proofsByMint[mint.absoluteString] = arr

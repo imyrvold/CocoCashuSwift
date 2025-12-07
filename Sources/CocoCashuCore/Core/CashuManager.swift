@@ -13,6 +13,7 @@ public final class CashuManager: @unchecked Sendable {
   public let quoteService: QuoteService
   public let mintService: MintService
   private var plugins: [CashuPlugin] = []
+  public let history: HistoryService
 
   public init(
     proofRepo: ProofRepository,
@@ -22,11 +23,12 @@ public final class CashuManager: @unchecked Sendable {
     api: MintAPI,
     blinding: BlindingEngine
   ) {
-    self.events = EventBus()
+    events = EventBus()
+    history = HistoryService(events: events)
     let ps = ProofService(proofs: proofRepo, events: events)
-    self.proofService = ps
-    self.quoteService = QuoteService(quotes: quoteRepo, events: events)
-    self.mintService = MintService(mints: mintRepo, proofs: ps, events: events, api: api, blinding: blinding)
+    proofService = ps
+    quoteService = QuoteService(quotes: quoteRepo, events: events)
+      mintService = MintService(mints: mintRepo, proofs: ps, events: events, api: api, blinding: blinding, history: history)
   }
 
   public func use(_ plugin: CashuPlugin) async {

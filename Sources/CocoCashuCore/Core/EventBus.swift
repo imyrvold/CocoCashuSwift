@@ -6,6 +6,7 @@ public enum WalletEvent: Sendable {
   case quoteUpdated(Quote)
   case quoteExecuted(QuoteId)
   case mintSynced(MintURL)
+  case historyUpdated
 }
 
 public protocol EventSink: Sendable {
