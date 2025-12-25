@@ -7,7 +7,9 @@ public protocol MintAPI: Sendable {
     func requestTokens(mint: MintURL, for invoice: String) async throws -> [Proof]
     func requestMeltQuote(mint: MintURL, amount: Int64, destination: String) async throws -> (quoteId: String, feeReserve: Int64)
     func executeMelt(mint: MintURL, quoteId: String, inputs: [Proof], outputs: [BlindedOutput]) async throws -> (preimage: String, change: [BlindSignatureDTO]?)
-    func swap(mint: MintURL, inputs: [Proof], outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO]}
+    func swap(mint: MintURL, inputs: [Proof], outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO]
+    func mint(quoteId: String, outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO]
+}
 
 public actor MintService {
     private let mints: MintRepository
