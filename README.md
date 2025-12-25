@@ -25,7 +25,7 @@ Add this package to your project via Swift Package Manager:
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "[https://github.com/yourusername/CocoCashuSwift.git](https://github.com/yourusername/CocoCashuSwift.git)", from: "0.1.0")
+    .package(url: "[https://github.com/imyrvold/CocoCashuSwift.git](https://github.com/imyrvold/CocoCashuSwift.git)", from: "0.1.0")
 ]
 ```
 
