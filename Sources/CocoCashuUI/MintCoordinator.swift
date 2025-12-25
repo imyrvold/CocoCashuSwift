@@ -36,32 +36,6 @@ public final class MintCoordinator {
         throw CashuError.network("Quote not paid in time")
     }
     
-    /// Execute a PAID quote via NUT-04: plan -> blind -> execute -> unblind -> store
-    private func executePaidQuote(mint: URL, quoteId: String, amount: Int64) async throws {
-
-      // 1) Choose denomination split for `amount` (e.g., 10 -> [8,2])
-      let parts = try await blinding.planOutputs(amount: amount, mint: mint)
-
-      // 2) Produce blinded outputs (B_) and keep blinding secrets internally
-      let blinded = try await blinding.blind(parts: parts, mint: mint) // [BlindedOutput]
-
-      // 3) Execute the mint: POST /v1/mint/bolt11 { quote, outputs }
-
-      // 4) Unblind signatures into spendable Proofs
-        let signatures = try await api.mint(quoteId: quoteId, outputs: blinded)
-        let proofs = try await blinding.unblind(signatures: signatures, for: parts, mint: mint)
-        // 5) Store proofs and notify listeners
-        manager.events.emit(.proofsUpdated(mint: mint))
-      try await manager.proofService.addNew(proofs)
-      manager.events.emit(.proofsUpdated(mint: mint))
-        await manager.history.add(CashuTransaction(
-            type: .mint,
-            amount: amount,
-            memo: "Minted via Lightning (NUT-04)",
-            status: .success
-        ))
-    }
-    
     public func receiveTokens(mint: URL, invoice: String?, quoteId: String?, amount: Int64?) async throws {
         do {
             let proofs: [Proof]
@@ -75,19 +49,10 @@ public final class MintCoordinator {
             } else {
                 throw CashuError.invalidQuote
             }
-            try await manager.proofService.addNew(proofs)
-            manager.events.emit(.proofsUpdated(mint: mint))
-            
-            let total = proofs.map(\.amount).reduce(0, +)
-            await manager.history.add(CashuTransaction(
-                type: .mint,
-                amount: total,
-                memo: "Minted via Lightning",
-                status: .success
-            ))
+            try await saveProofs(proofs, mint: mint)
             return
         } catch {
-            // If redemption by quote/invoice failed, fall back to proper NUT-04 execution
+            // Fallback to NUT-04 execution if simple redemption failed
             if let qid = quoteId, let amt = amount {
                 print("MintCoordinator: falling back to NUT-04 execute for \(qid)")
                 try await executePaidQuote(mint: mint, quoteId: qid, amount: amt)
@@ -96,4 +61,36 @@ public final class MintCoordinator {
             throw error
         }
     }
+    
+    // MARK: - Private Helpers
+    private func executePaidQuote(mint: URL, quoteId: String, amount: Int64) async throws {
+        // 1. Plan
+        let parts = try await blinding.planOutputs(amount: amount, mint: mint)
+        
+        // 2. Blind
+        let blinded = try await blinding.blind(parts: parts, mint: mint)
+        
+        // 3. Execute (Using the mint() method we added to the protocol earlier)
+        let signatures = try await api.mint(quoteId: quoteId, outputs: blinded)
+        
+        // 4. Unblind
+        let proofs = try await blinding.unblind(signatures: signatures, for: parts, mint: mint)
+        
+        // 5. Save
+        try await saveProofs(proofs, mint: mint)
+        
+        await manager.history.add(CashuTransaction(
+            type: .mint,
+            amount: amount,
+            memo: "Minted via Lightning (NUT-04)",
+            status: .success
+        ))
+    }
+    
+    private func saveProofs(_ proofs: [Proof], mint: URL) async throws {
+        try await manager.proofService.addNew(proofs)
+        // Emit event so UI updates immediately
+        manager.events.emit(.proofsUpdated(mint: mint))
+    }
+    
 }
