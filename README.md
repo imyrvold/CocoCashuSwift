@@ -1,74 +1,87 @@
-# CocoCashuSwift
+# CocoCashuSwift 🥥Lib
 
-A Swift port of the [coco-cashu](https://github.com/Egge21M/coco-cashu) library.  
-This package provides a modular Cashu wallet core written in Swift.
+A comprehensive, modular Swift SDK for building [Cashu](https://cashu.space) wallets. This library abstracts away the complexities of NUT protocols, blinding signatures, and proof management, allowing you to focus on building great UI.
 
-## 📦 Structure
+## Modules
 
-## 🚀 Getting Started
+The library is split into two targets to ensure separation of concerns:
 
-1. Clone or unzip this package:
+### 1. CocoCashuCore
+The engine room. Pure Swift logic with ****no UI dependencies****.
+- ****Networking:**** `RealMintAPI` handling NUT-04 (Mint), NUT-05 (Melt), and NUT-06 (Split).
+- ****Cryptography:**** BDHKE (Blind Diffie-Hellman Key Exchange) implementation using `ksec` primitives.
+- ****Storage:**** Actor-based `ProofRegistry` and `MintRegistry` for thread-safe persistence.
+- ****Models:**** Codable structs for `Proof`, `Token`, `BlindedSignature`, etc.
 
-   ```bash
-   cd CocoCashuSwift
-   
-    2.    Build a local zip archive for Xcode:
-    zip -r CocoCashuSwift.zip .
-    
-    3.    In Xcode, go to:
-    File > Add Packages... > Add Local
-    
-Select your CocoCashuSwift.zip.
+### 2. CocoCashuUI
+SwiftUI helpers and state management.
+- ****ObservableWallet:**** A complete `@Observable` View Model that manages the wallet lifecycle.
+- ****MintCoordinator:**** Encapsulates the complex state machine of the Minting flow (Invoice -> Polling -> Blinding -> Signing).
 
-    4.    To run the demo app:
-    •    Open CashuDemoApp/CashuDemoApp.xcodeproj
-    •    Run on iOS Simulator or macOS
+## Installation
 
-🧩 Features
-    •    Core (CocoCashuCore)
-    •    Strongly typed models: Proof, Mint, Quote, Token
-    •    Storage-agnostic repositories
-    •    Services: proof management, quote lifecycle
-    •    Typed event bus (WalletEvent)
-    •    UI (CocoCashuUI)
-    •    ObservableWallet integrates with SwiftUI via @Observable
-    •    Demo App
-    •    Simple SwiftUI wallet
-    •    In-memory repositories
-    •    Buttons to mint fake sats and spend them
+Add this package to your project via Swift Package Manager:
 
-📸 Screenshot
+```swift
+// Package.swift
+dependencies: [
+    .package(url: "[https://github.com/yourusername/CocoCashuSwift.git](https://github.com/yourusername/CocoCashuSwift.git)", from: "0.1.0")
+]
+```
 
-Here’s how the demo looks when running:
+## Usage Example
+**Initializing the Manager**
+```swift
+import CocoCashuCore
+import CocoCashuUI
 
---------------------------
- Cashu Demo Wallet
---------------------------
-Mint: https://mint.test
-Total: 100 sats
-• 100 sats (unspent)
+// 1. Setup the Network Layer
+let api = RealMintAPI(baseURL: URL(string: "[https://cashu.cz](https://cashu.cz)")!)
 
-[ Mint 100 sats ]  [ Spend 50 sats ]
+// 2. Setup the Blinding Engine
+let engine = CocoBlindingEngine { mintURL in
+    try await RealMintAPI(baseURL: mintURL).fetchKeyset()
+}
 
-👉 After you run it in the iOS Simulator:
-    •    Press ⌘ + S (or File > Save Screenshot) to capture a real image.
-    •    Save it as CashuDemoApp/Screenshot.png.
-    •    Then update the README to display it:
-    
-![Demo Screenshot](CashuDemoApp/Screenshot.png)
+// 3. Initialize the Manager
+let manager = CashuManager(
+    proofRepo: ProofRegistry(),
+    mintRepo: MintRegistry(),
+    quoteRepo: InMemoryQuoteRepository(),
+    counterRepo: InMemoryCounterRepository(),
+    api: api,
+    blinding: engine
+)
 
-📝 Notes
-    •    This demo does not implement full Cashu cryptography or HTTP API calls.
-    •    InMemory*Repository is used for storage. Replace with SQLite or server-backed repos for persistence.
-    •    Extend DemoAPI.swift with real mint endpoints to interact with live Cashu mints.
+// 4. Create the Wallet View Model
+let wallet = ObservableWallet(manager: manager)
+```
 
-✅ Roadmap
-    •    Add SQLite repo support (via GRDB)
-    •    Implement real Cashu Mint API client
-    •    Add proof splitting/merging logic
-    •    Integrate Lightning invoices (BOLT11)
+**Minting Tokens**
+```swift
+let coordinator = MintCoordinator(manager: manager, api: manager.api, blinding: manager.blinding)
 
-⸻
+// 1. Get Invoice
+let (invoice, quoteId) = try await coordinator.topUp(mint: mintURL, amount: 100)
 
-Made with ❤️ in Swift, inspired by coco-cashu.
+// 2. Wait for Payment (Blocking or Polling)
+try await coordinator.pollUntilPaid(mint: mintURL, quoteId: quoteId)
+
+// 3. Receive Tokens (Auto-adds to wallet)
+try await coordinator.receiveTokens(mint: mintURL, quoteId: quoteId, amount: 100)
+```
+
+# Supported NUTS
+| NUT | Description | Status |
+|---|---|---|
+| **00** | Cryptography & Models | ✅ |
+| **01** | Mint Public Keys | ✅ |
+| **02** | Keysets | ✅ |
+| **03** | Swap (Split) | ✅ |
+| **04** | Mint Tokens | ✅ |
+| **05** | Melt (Lightning Pay) | ✅ |
+| **06** | Mint Info | ✅ |
+
+# License
+MIT License.
 
