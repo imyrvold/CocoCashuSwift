@@ -5,17 +5,22 @@ public protocol MintAPI: Sendable {
     func requestMintQuote(mint: MintURL, amount: Int64) async throws -> (invoice: String, expiresAt: Date?, quoteId: String?)
     func checkQuoteStatus(mint: MintURL, invoice: String) async throws -> QuoteStatus
     func requestTokens(mint: MintURL, for invoice: String) async throws -> [Proof]
+    func requestTokens(quoteId: String, blindedMessages: [BlindedOutput], mint: MintURL) async throws -> [BlindSignatureDTO]
     func requestMeltQuote(mint: MintURL, amount: Int64, destination: String) async throws -> (quoteId: String, feeReserve: Int64)
     func executeMelt(mint: MintURL, quoteId: String, inputs: [Proof], outputs: [BlindedOutput]) async throws -> (preimage: String, change: [BlindSignatureDTO]?)
     func swap(mint: MintURL, inputs: [Proof], outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO]
     func mint(quoteId: String, outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO]
+    func restore(mint: URL, outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO]
+    func check(mint: URL, proofs: [ProofDTO]) async throws -> [CheckStateDTO]
+    func fetchKeysetIds(mint: URL) async throws -> [String]
+    func fetchKeyset(mint: URL, id: String) async throws -> Keyset
 }
 
 public actor MintService {
     private let mints: MintRepository
     private let proofs: ProofService
     private let events: EventBus
-    private let api: MintAPI
+    public let api: MintAPI
     private let blinding: BlindingEngine
     private let history: HistoryService
     
@@ -29,13 +34,56 @@ public actor MintService {
     }
     
     /// After invoice is paid, fetch minted proofs (receive tokens).
-    public func receiveTokens(for quote: Quote) async throws {
-        let newProofs = try await api.requestTokens(mint: quote.mint, for: quote.invoice ?? "")
-        try await proofs.addNew(newProofs)
+
+/*    public func receiveTokens(for quote: Quote) async throws {
+        print("⚡️ MINT: Attempting to claim quote \(quote.id) for \(quote.amount) sats...")
         
-        let total = newProofs.map(\.amount).reduce(0, +)
+        // 1. Plan and Blind (Generate secrets)
+        // These 'blinded' structs hold the SECRETS in memory. We must not lose them.
+        let parts = try await blinding.planOutputs(amount: quote.amount, mint: quote.mint)
+        let blindedOutputs = try await blinding.blind(parts: parts, mint: quote.mint)
+        
+        // Convert to the DTO format the API expects
+        // (Assuming you resolved the struct differences from the previous step)
+        let apiInputs = blindedOutputs.map { BlindedOutput(amount: $0.amount, B_: $0.B_, id: $0.id) }
+        
+        var signatures: [BlindSignatureDTO] = []
+        
+        do {
+            // 2. Try to Mint normally
+            signatures = try await api.requestTokens(
+                quoteId: quote.id.uuidString,
+                blindedMessages: apiInputs,
+                mint: quote.mint
+            )
+            
+        } catch let error {
+            // 3. RECOVERY HANDLER
+            // Check if the error indicates "Already Signed" (Code 10002)
+            let errorString = String(describing: error)
+            if errorString.contains("already been signed") || errorString.contains("10002") {
+                print("⚠️ Network Glitch Detected: Mint already signed these outputs. Attempting RESTORE...")
+                
+                // Call RESTORE (NUT-05) to fetch the signatures we missed
+                signatures = try await api.restore(mint: quote.mint, outputs: apiInputs)
+                
+                print("✅ RESTORE SUCCESS: Recovered \(signatures.count) signatures!")
+            } else {
+                // Genuine failure (e.g. quote not paid yet)
+                throw error
+            }
+        }
+        
+        // 4. Unblind and Save (Standard flow)
+        // Now we have the signatures (either from the first try or the restore), so we can finish.
+        let proofs = try await blinding.unblind(signatures: signatures, for: parts, mint: quote.mint)
+        try await self.proofs.addNew(proofs)
+        
+        let total = proofs.map { $0.amount }.reduce(0, +)
         await history.add(CashuTransaction(type: .mint, amount: total, memo: "Minted via Lightning", status: .success))
-    }
+        
+        print("✅ MINT: Success! Added \(total) sats.")
+    }*/
     
     /// Spend tokens (melt) with Change handling
     public func spend(amount: Int64, from mint: MintURL, to destination: String) async throws {
@@ -69,10 +117,11 @@ public actor MintService {
                 outputs = []
             }
             
-            let (preimage, changeSigs) = try await api.executeMelt(mint: mint, quoteId: quoteId, inputs: inputs, outputs: outputs)
+            let (_, changeSigs) = try await api.executeMelt(mint: mint, quoteId: quoteId, inputs: inputs, outputs: outputs)
             
             if let sigs = changeSigs, !sigs.isEmpty, !changeParts.isEmpty {
-                let changeProofs = try await blinding.unblind(signatures: sigs, for: changeParts, mint: mint)
+                let allBlinded = try await blinding.blind(parts: changeParts, mint: mint)
+                let changeProofs = try await blinding.unblind(signatures: sigs, for: allBlinded, mint: mint)
                 try await proofs.addNew(changeProofs)
             }
             
@@ -124,18 +173,16 @@ public actor MintService {
             let changeParts = (changeAmt > 0) ? try await blinding.planOutputs(amount: changeAmt, mint: mint) : []
             
             // Blind everything
-            let tokenBlinded = try await blinding.blind(parts: tokenParts, mint: mint)
-            let changeBlinded = try await blinding.blind(parts: changeParts, mint: mint)
             let allParts = tokenParts + changeParts
             
             // 2. Blind ONCE
             let allOutputs = try await blinding.blind(parts: allParts, mint: mint)
             
             // 3. Swap
+            let allBlinded = try await blinding.blind(parts: allParts, mint: mint)
             let signatures = try await api.swap(mint: mint, inputs: inputs, outputs: allOutputs)
-            
             // 4. Unblind Everything
-            let allProofs = try await blinding.unblind(signatures: signatures, for: allParts, mint: mint)
+            let allProofs = try await blinding.unblind(signatures: signatures, for: allBlinded, mint: mint)
             
             // 5. Split the results back into Token vs Change
             // We know the first N proofs correspond to the tokenParts
@@ -171,7 +218,7 @@ public actor MintService {
         }
     }
     
-    public func receiveToken(_ tokenString: String) async throws -> Int64 {
+/*    public func receiveToken(_ tokenString: String) async throws -> Int64 {
         // 1. Parse
         let tokenData = try TokenHelper.deserialize(tokenString)
         guard let entry = tokenData.token.first, let mintURL = URL(string: entry.mint) else {
@@ -207,5 +254,64 @@ public actor MintService {
         await history.add(CashuTransaction(type: .mint, amount: amountToReceive, fee: swapFee, memo: "Received Token", status: .success))
         
         return amountToReceive
+    }*/
+    
+    /// Swaps specific proofs for a target amount (to send) + change.
+    /// Returns: (change: [Proof], token: String)
+    /// - change: The proofs you keep (put back in wallet).
+    /// - token: The serialized token string you give to the recipient.
+    public func swap(proofs inputProofs: [Proof], amount: Int64, mint: MintURL) async throws -> (change: [Proof], token: String) {
+        
+        // 1. Calculate Math
+        let totalInput = inputProofs.map(\.amount).reduce(0, +)
+        
+        // FEE CALCULATION:
+        // Most mints are free for swaps, but 'Strict' mints (like cashu.cz sometimes)
+        // might charge. A safe heuristic is 0 or 1 sat per input.
+        // We will assume 0 for now to keep math simple, or use inputs.count if you see errors.
+        let fee: Int64 = 0
+        
+        let changeAmount = totalInput - amount - fee
+        
+        guard changeAmount >= 0 else {
+            // This usually happens if inputs barely cover amount and fee pushes it over.
+            throw CashuError.insufficientFunds
+        }
+        
+        // 2. Plan Outputs (Token + Change)
+        // A. The Token for the recipient
+        let tokenParts = try await blinding.planOutputs(amount: amount, mint: mint)
+        
+        // B. The Change for us
+        let changeParts = (changeAmount > 0) ? try await blinding.planOutputs(amount: changeAmount, mint: mint) : []
+        
+        // Combine them for the API call
+        let allParts = tokenParts + changeParts
+        
+        // 3. Network Swap
+        // 'allBlinded' contains the BlindedOutput structs with your LOCAL SECRETS.
+        let allBlinded = try await blinding.blind(parts: allParts, mint: mint)
+        
+        let signatures = try await api.swap(mint: mint, inputs: inputProofs, outputs: allBlinded)
+        
+        // 4. Unblind
+        // FIX: Pass 'allBlinded' here, NOT 'allParts'.
+        // The new unblind function needs the 'BlindedOutput' structs to retrieve the secrets.
+        let allProofs = try await blinding.unblind(signatures: signatures, for: allBlinded, mint: mint)
+        
+        // 5. Separate "Token" from "Change"
+        // We know the first N proofs belong to the Token because we put them first in 'allParts'
+        guard allProofs.count == allParts.count else {
+            throw CashuError.protocolError("Swap returned wrong number of proofs")
+        }
+        
+        let tokenCount = tokenParts.count
+        let tokenProofs = Array(allProofs.prefix(tokenCount))
+        let changeProofs = Array(allProofs.suffix(from: tokenCount))
+        
+        // 6. Serialize
+        let tokenString = try TokenHelper.serialize(tokenProofs, mint: mint)
+        
+        return (change: changeProofs, token: tokenString)
     }
 }

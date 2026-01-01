@@ -14,6 +14,11 @@ public struct HDKey {
         self.chainCode = data.suffix(32)
     }
     
+    private init(key: SymmetricKey, chainCode: Data) {
+        self.key = key
+        self.chainCode = chainCode
+    }
+    
     // Private Child Derivation (CKDpriv)
     // Support hardened derivation (index >= 0x80000000)
     public func derive(index: UInt32) -> HDKey? {

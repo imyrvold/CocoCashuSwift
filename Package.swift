@@ -12,15 +12,18 @@ let package = Package(
   ],
   dependencies: [
     .package(url: "https://github.com/GigaBitcoin/secp256k1.swift", exact: "0.2.0"),
+    .package(url: "https://github.com/pengpengliu/BIP39", from: "1.0.0")
   ],
   targets: [
     .target(
       name: "CocoCashuCore",
       dependencies: [
-        .product(name: "secp256k1", package: "secp256k1.swift")
+        .product(name: "secp256k1", package: "secp256k1.swift"),
+        .product(name: "BIP39", package: "BIP39")
       ]
     ),
     .target(name: "CocoCashuUI", dependencies: ["CocoCashuCore"]),
     .testTarget(name: "CocoCashuCoreTests", dependencies: ["CocoCashuCore"]),
   ]
 )
+

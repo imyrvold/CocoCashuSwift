@@ -6,9 +6,19 @@ public struct RealMintAPI: MintAPI, Sendable {
     public let baseURL: URL
     private let session: URLSession
     
-    public init(baseURL: URL, session: URLSession = .shared) {
+    public init(baseURL: URL, session: URLSession? = nil) {
         self.baseURL = baseURL
-        self.session = session
+        
+        if let s = session {
+            self.session = s
+        } else {
+            // Create a custom config that fails fast instead of retrying
+            let config = URLSessionConfiguration.default
+            config.waitsForConnectivity = false // CRITICAL: Prevents auto-retries on network switch
+            config.timeoutIntervalForRequest = 30
+            config.timeoutIntervalForResource = 300
+            self.session = URLSession(configuration: config)
+        }
     }
     
     // MARK: - Tolerant response models
@@ -213,67 +223,59 @@ public struct RealMintAPI: MintAPI, Sendable {
     public func requestTokens(mint: MintURL, for invoice: String) async throws -> [Proof] {
         do {
             let r: MintTokenResponse = try await postJSON(MintTokenResponse.self, path: "/v1/mint", body: ["invoice": invoice])
-            return r.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hexOrBase64: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") }
+            return r.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hex: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") }
         } catch {
             do {
                 let r2: MintTokenResponse = try await postJSON(MintTokenResponse.self, path: "/v1/mint", body: ["payment_request": invoice])
-                return r2.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hexOrBase64: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") }
+                return r2.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hex: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") }
             } catch {
                 throw error
             }
         }
     }
     
-    public func requestTokens(quoteId: String, mint: MintURL) async throws -> [Proof] {
-        do {
-            let r: MintTokenResponse = try await postJSON(MintTokenResponse.self,
-                                                          path: "/v1/mint/quote/bolt11/\(quoteId)",
-                                                          anyBody: [:])
-            if !r.proofs.isEmpty { return r.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hexOrBase64: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") } }
-            if let s = r.rawTokenString, let parsed = parseCashuTokenString(s, mintURL: mint) { return parsed }
-        } catch { print("RealMintAPI redeem POST quoteId path failed:", error) }
+    
+    // Note: We pass the full blindedMessages here because we need the 'secret' and 'r'
+    // stored inside them to construct the final Proofs after the network call returns.
+    // In RealMintAPI.swift
+
+    // Update return type to [String] (List of hex signatures)
+    // In RealMintAPI.swift
+
+    // In RealMintAPI.swift
+
+    public func requestTokens(quoteId: String, blindedMessages: [BlindedOutput], mint: MintURL) async throws -> [BlindSignatureDTO] {
         
-        do {
-            let r: MintTokenResponse = try await postJSON(MintTokenResponse.self,
-                                                          path: "/v1/mint/quote/\(quoteId)/bolt11",
-                                                          anyBody: [:])
-            if !r.proofs.isEmpty { return r.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hexOrBase64: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") } }
-            if let s = r.rawTokenString, let parsed = parseCashuTokenString(s, mintURL: mint) { return parsed }
-        } catch { print("RealMintAPI redeem POST quoteId/bolt11 failed:", error) }
-        
-        do {
-            let data = try await getRaw(path: "/v1/mint/quote/bolt11/\(quoteId)")
-            if let s = String(data: data, encoding: .utf8) { print("RealMintAPI redeem GET raw:", s) }
-            // Try JSON -> { token: "cashuA..." } first
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let tokenStr = obj["token"] as? String, let parsed = parseCashuTokenString(tokenStr, mintURL: mint) {
-                return parsed
-            }
-            if let r = try? decodeJSON(MintTokenResponse.self, data: data), !r.proofs.isEmpty {
-                return r.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hexOrBase64: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") }
-            }
-        } catch { print("RealMintAPI redeem GET quoteId path failed:", error) }
-        
-        if let r: MintTokenResponse = try? await postJSON(MintTokenResponse.self,
-                                                          path: "/v1/mint",
-                                                          body: ["quote": quoteId]) {
-            if !r.proofs.isEmpty { return r.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hexOrBase64: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") } }
-            if let s = r.rawTokenString, let parsed = parseCashuTokenString(s, mintURL: mint) { return parsed }
+        // 1. Prepare Payload
+        // FIX: Add "id": $0.id to the dictionary. The Mint requires it.
+        let outputsPayload = blindedMessages.map {
+            [
+                "amount": $0.amount,
+                "B_": $0.B_,
+                "id": $0.id  // <-- THIS WAS MISSING
+            ]
         }
         
-        if let r: MintTokenResponse = try? await postJSON(MintTokenResponse.self,
-                                                          path: "/v1/mint",
-                                                          body: ["quote_id": quoteId]) {
-            if !r.proofs.isEmpty { return r.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hexOrBase64: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") } }
-            if let s = r.rawTokenString, let parsed = parseCashuTokenString(s, mintURL: mint) { return parsed }
-        }
-        if let r: MintTokenResponse = try? await postJSON(MintTokenResponse.self,
-                                                          path: "/v1/mint",
-                                                          body: ["id": quoteId]) {
-            if !r.proofs.isEmpty { return r.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hexOrBase64: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") } }
-            if let s = r.rawTokenString, let parsed = parseCashuTokenString(s, mintURL: mint) { return parsed }
+        let body: [String: Any] = [
+            "quote": quoteId,
+            "outputs": outputsPayload
+        ]
+        
+        // 2. Request
+        let r: MintingResponse = try await postJSON(MintingResponse.self, path: "/v1/mint/bolt11", body: body)
+        
+        // 3. Validation
+        guard r.signatures.count == blindedMessages.count else {
+            throw CashuError.network("Mint returned mismatched number of signatures.")
         }
         
-        throw CashuError.network("Could not redeem tokens for quote id \(quoteId)")
+        // 4. Map to DTO
+        return r.signatures.map { signature in
+            BlindSignatureDTO(
+                amount: signature.amount,
+                C_: signature.C_
+            )
+        }
     }
     
     public func requestMeltQuote(mint: MintURL, amount: Int64, destination: String) async throws -> (quoteId: String, feeReserve: Int64) {
@@ -409,7 +411,7 @@ public struct RealMintAPI: MintAPI, Sendable {
             let token: [Entry]
         }
         guard let root = try? JSONDecoder().decode(TokenRoot.self, from: data), let first = root.token.first else { return nil }
-        return first.proofs.map { Proof(amount: $0.amount, mint: mintURL, secret: Data(hexOrBase64: $0.secret) ?? Data(), C: "", keysetId: "") }
+        return first.proofs.map { Proof(amount: $0.amount, mint: mintURL, secret: Data(hex: $0.secret) ?? Data(), C: "", keysetId: "") }
     }
     
     // Models for NUT-04 execution
@@ -469,6 +471,11 @@ public struct RealMintAPI: MintAPI, Sendable {
         throw CashuError.protocolError("Mint /v1/keys did not contain a usable keyset")
     }
     
+    public func fetchKeyset(mint: URL) async throws -> Keyset {
+        let tempApi = RealMintAPI(baseURL: mint)
+        return try await tempApi.fetchKeyset()
+    }
+    
     /// Execute a PAID mint quote by submitting blinded outputs.
     /// Returns the raw blind signatures; you must unblind to create Proofs.
     private func executeMint(quoteId: String, outputs: [BlindedMessageDTO]) async throws -> [BlindSignatureDTO] {
@@ -505,12 +512,27 @@ public struct RealMintAPI: MintAPI, Sendable {
     }
     
     public func swap(mint: MintURL, inputs: [Proof], outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO] {
+        // 1. Prepare Inputs (Proofs to spend)
         let inputDTOs: [[String: Any]] = inputs.map {
-            ["id": $0.keysetId, "amount": $0.amount, "secret": $0.secret.hexString, "C": $0.C]
+            [
+                "id": $0.keysetId,
+                "amount": $0.amount,
+                
+                // FIX: Convert Data back to String, don't use hexString.
+                // The secret is stored as UTF-8 bytes of the random string.
+                "secret": String(data: $0.secret, encoding: .utf8) ?? "",
+                
+                "C": $0.C
+            ]
         }
         
+        // 2. Prepare Outputs (New tokens to create)
         let outputDTOs: [[String: Any]] = outputs.map {
-            ["id": $0.id, "amount": $0.amount, "B_": $0.B_]
+            [
+                "id": $0.id,
+                "amount": $0.amount,
+                "B_": $0.B_
+            ]
         }
         
         let payload: [String: Any] = [
@@ -518,11 +540,11 @@ public struct RealMintAPI: MintAPI, Sendable {
             "outputs": outputDTOs
         ]
         
+        // 3. Call API
         struct SwapResponse: Decodable {
             let signatures: [BlindSignatureDTO]?
-            let promises: [BlindSignatureDTO]?
             
-            var all: [BlindSignatureDTO] { signatures ?? promises ?? [] }
+            var all: [BlindSignatureDTO] { signatures ?? [] }
         }
         
         // 4. Call /v1/split
@@ -533,6 +555,8 @@ public struct RealMintAPI: MintAPI, Sendable {
             throw CashuError.protocolError("Swap returned no signatures")
         }
         
+        // 4. Map to DTO
+        // Note: Swap signatures are blind (C_), so C is usually nil in the response.
         return r.all
     }
     
@@ -568,33 +592,147 @@ public struct RealMintAPI: MintAPI, Sendable {
             BlindSignatureDTO(amount: sig.amount, C_: sig.C_, C: nil)
         }
     }
-}
 
-
-// MARK: - Small helpers
-
-private extension Data {
-  /// Try hex first, fall back to base64.
-  nonisolated init?(hexOrBase64: String) {
-    if let d = Data(hex: hexOrBase64) { self = d; return }
-    if let d = Data(base64Encoded: hexOrBase64) { self = d; return }
-    return nil
-  }
-    nonisolated init?(hex: String) {
-    let s = hex.hasPrefix("0x") ? String(hex.dropFirst(2)) : hex
-    let len = s.count
-    guard len % 2 == 0 else { return nil }
-    var data = Data(capacity: len/2)
-    var idx = s.startIndex
-    while idx < s.endIndex {
-      let next = s.index(idx, offsetBy: 2)
-      guard next <= s.endIndex else { return nil }
-      let byteStr = s[idx..<next]
-      guard let b = UInt8(byteStr, radix: 16) else { return nil }
-      data.append(b)
-      idx = next
+    public func restore(mint: URL, outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO] {
+        // Endpoint: POST /v1/restore
+        let url = mint.appendingPathComponent("v1/restore")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        // Body: { "outputs": [ ... ] }
+        let body: [String: Any] = [
+            "outputs": outputs.map { ["amount": $0.amount, "B_": $0.B_, "id": $0.id] }
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let errorMsg = String(data: data, encoding: .utf8) ?? "Unknown"
+            print("⚠️ Restore Failed: \(errorMsg)")
+            throw CashuError.network("Restore failed with status: \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+        }
+        
+        // Response: { "outputs": [], "promises": [ { "amount": 1, "C": "..." }, ... ] }
+        struct RestoreResponse: Decodable {
+            let promises: [BlindSignatureDTO]
+        }
+        
+        let decoded = try JSONDecoder().decode(RestoreResponse.self, from: data)
+        return decoded.promises
     }
-    self = data
-  }
-    nonisolated var hexString: String { self.map { String(format: "%02x", $0) }.joined() }
+    
+    public func check(mint: URL, proofs: [ProofDTO]) async throws -> [CheckStateDTO] {
+        let url = mint.appendingPathComponent("v1/check")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let body: [String: Any] = [
+            "proofs": proofs.map {
+                ["amount": $0.amount, "secret": $0.secret, "C": $0.C, "id": $0.id]
+            }
+        ]
+        
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw CashuError.network("Check failed with status: \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+        }
+        
+        struct CheckResponse: Decodable {
+            let states: [CheckStateDTO]
+        }
+        
+        let decoded = try JSONDecoder().decode(CheckResponse.self, from: data)
+        return decoded.states
+    }
+    
+    // In RealMintAPI.swift
+    
+    public func fetchKeysetIds(mint: URL) async throws -> [String] {
+        // Try the standard V1 endpoint for all keysets
+        struct KeysetsResponse: Decodable {
+            struct KeysetInfo: Decodable {
+                let id: String
+                let active: Bool?
+            }
+            let keysets: [KeysetInfo]
+        }
+        
+        // Handle trailing slash issues safely for the path
+        let path = mint.path.hasSuffix("/") ? "v1/keysets" : "/v1/keysets"
+        
+        // We have to build the request manually here because getJSON uses self.baseURL
+        let url = mint.appendingPathComponent(path)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10 // Fast timeout for checks
+        
+        do {
+            let (data, response) = try await session.data(for: request)
+            
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                let r = try JSONDecoder().decode(KeysetsResponse.self, from: data)
+                return r.keysets.map { $0.id }
+            }
+        } catch {
+            // Ignore error, fall through to fallback
+        }
+        // 2. FALLBACK: If /v1/keysets doesn't exist, fetch the single active keyset
+        let singleKeyset = try await fetchKeyset(mint: mint)
+        return [singleKeyset.id]
+    }
+    
+    // Fetch keys for a SPECIFIC keyset ID
+    public func fetchKeyset(mint: URL, id: String) async throws -> Keyset {
+        // 1. Construct URL: /v1/keys/{keyset_id}
+        // Safe URL handling for the ID
+        let path = "v1/keys/\(id)"
+        let url = mint.appendingPathComponent(path)
+        
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw CashuError.network("Could not fetch keys for ID \(id)")
+        }
+        
+        // 2. Decode Response (NUT-01 format)
+        struct KeysResponse: Decodable {
+            struct KeysetInfo: Decodable {
+                let id: String
+                let keys: [String: String]
+            }
+            let keysets: [KeysetInfo]
+        }
+        
+        let r = try JSONDecoder().decode(KeysResponse.self, from: data)
+        
+        // 3. Convert to internal Keyset model
+        guard let ks = r.keysets.first else {
+            throw CashuError.protocolError("Empty keyset response for ID \(id)")
+        }
+        
+        var map: [Int64: String] = [:]
+        for (k, v) in ks.keys {
+            if let amt = Int64(k) { map[amt] = v }
+        }
+        
+        return Keyset(id: ks.id, keys: map)
+    }
 }
+
+private struct MintingResponse: Decodable {
+    struct BlindSignature: Decodable {
+        let amount: Int64
+        let C_: String     // The blind signature
+        let id: String?    // The keyset ID
+    }
+    let signatures: [BlindSignature]
+}
+

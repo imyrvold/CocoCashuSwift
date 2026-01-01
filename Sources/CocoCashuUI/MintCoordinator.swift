@@ -37,54 +37,87 @@ public final class MintCoordinator {
     }
     
     public func receiveTokens(mint: URL, invoice: String?, quoteId: String?, amount: Int64?) async throws {
-        do {
-            let proofs: [Proof]
-            
-            // Try explicit token request via RealMintAPI if possible
-            if let qid = quoteId, let real = api as? RealMintAPI {
-                proofs = try await real.requestTokens(quoteId: qid, mint: mint)
-                // Fallback to Invoice
-            } else if let inv = invoice {
-                proofs = try await api.requestTokens(mint: mint, for: inv)
-            } else {
-                throw CashuError.invalidQuote
-            }
+        // 1. Prefer the modern Quote flow (NUT-04)
+        if let qid = quoteId, let amt = amount {
+            print("MintCoordinator: executing mint for quote \(qid)")
+            // This function (which you likely have defined elsewhere) handles the full blinding/unblinding cycle
+            try await executePaidQuote(mint: mint, quoteId: qid, amount: amt)
+            return
+        }
+        
+        // 2. Legacy/Fallback for Invoice-only mints (NUT-03/old)
+        else if let inv = invoice {
+            // If 'api.requestTokens(mint:for:)' still returns [Proof], this is fine.
+            // If that function was also updated to return signatures, this block needs similar refactoring.
+            let proofs = try await api.requestTokens(mint: mint, for: inv)
             try await saveProofs(proofs, mint: mint)
             return
-        } catch {
-            // Fallback to NUT-04 execution if simple redemption failed
-            if let qid = quoteId, let amt = amount {
-                print("MintCoordinator: falling back to NUT-04 execute for \(qid)")
-                try await executePaidQuote(mint: mint, quoteId: qid, amount: amt)
-                return
-            }
-            throw error
+        }
+        
+        // 3. Error
+        else {
+            throw CashuError.invalidQuote
         }
     }
     
     // MARK: - Private Helpers
+    // MARK: - Private Helpers
+        
     private func executePaidQuote(mint: URL, quoteId: String, amount: Int64) async throws {
-        // 1. Plan
+        print("⚡️ MINT: Starting mint flow for \(amount) sats (Quote: \(quoteId))")
+        
+        // 1. Plan and Blind
+        // We generate the secrets here. We must keep 'blindedOutputs' in memory
+        // to handle the "Restore" fallback if the network fails.
         let parts = try await blinding.planOutputs(amount: amount, mint: mint)
+        let blindedOutputs = try await blinding.blind(parts: parts, mint: mint)
         
-        // 2. Blind
-        let blinded = try await blinding.blind(parts: parts, mint: mint)
+        var signatures: [BlindSignatureDTO] = []
         
-        // 3. Execute (Using the mint() method we added to the protocol earlier)
-        let signatures = try await api.mint(quoteId: quoteId, outputs: blinded)
+        do {
+            // 2. Attempt Request
+            // We use the 'api' property your Coordinator already has.
+            // Ensure RealMintAPI is updated to accept [BlindedOutput] as discussed.
+            signatures = try await api.requestTokens(
+                quoteId: quoteId,
+                blindedMessages: blindedOutputs,
+                mint: mint
+            )
+            
+        } catch let error {
+            // 3. RECOVERY LOGIC (The "Zombie Quote" Fix)
+            let errorString = String(describing: error)
+            
+            // Check for "Already Signed" (Error 10002)
+            if errorString.contains("already been signed") || errorString.contains("10002") {
+                print("⚠️ Network Glitch Detected: Mint already signed these outputs. Attempting RESTORE...")
+                
+                // Try to cast to RealMintAPI to access the specific 'restore' endpoint
+                if let realApi = api as? RealMintAPI {
+                    signatures = try await realApi.restore(mint: mint, outputs: blindedOutputs)
+                    print("✅ RESTORE SUCCESS: Recovered \(signatures.count) signatures!")
+                } else {
+                    print("❌ Restore failed: API is not RealMintAPI")
+                    throw error
+                }
+            } else {
+                // Genuine failure (e.g. Quote not paid yet)
+                print("❌ MINT FAILED: \(error)")
+                throw error
+            }
+        }
         
-        // 4. Unblind
-        let proofs = try await blinding.unblind(signatures: signatures, for: parts, mint: mint)
+        // 4. Unblind & Save
+        let proofs = try await blinding.unblind(signatures: signatures, for: blindedOutputs, mint: mint)
         
-        // 5. Save
-        try await saveProofs(proofs, mint: mint)
+        // Use the 'manager' property to access proofService
+        try await manager.proofService.addNew(proofs)
         
-        await manager.history.add(CashuTransaction(
-            type: .mint,
-            amount: amount,
-            memo: "Minted via Lightning (NUT-04)",
-            status: .success
-        ))
+        // Update UI
+        let total = proofs.map { $0.amount }.reduce(0, +)
+        manager.events.emit(.proofsUpdated(mint: mint))
+        
+        print("✅ MINT COMPLETE: Added \(total) sats to wallet.")
     }
     
     private func saveProofs(_ proofs: [Proof], mint: URL) async throws {

@@ -14,16 +14,30 @@ public protocol EventSink: Sendable {
 }
 
 public final class EventBus: @unchecked Sendable {
-  private let queue = DispatchQueue(label: "cashu.eventbus", qos: .userInitiated)
-  private var listeners: [@Sendable (WalletEvent) -> Void] = []
+    private let queue = DispatchQueue(label: "cashu.eventbus", qos: .userInitiated)
+    private var listeners: [@Sendable (WalletEvent) -> Void] = []
 
-  public init() {}
+    public init() {}
 
-  public func subscribe(_ listener: @escaping @Sendable (WalletEvent) -> Void) {
-    queue.sync { listeners.append(listener) }
-  }
+    public func subscribe(_ listener: @escaping @Sendable (WalletEvent) -> Void) {
+        queue.sync { listeners.append(listener) }
+    }
 
-  public func emit(_ event: WalletEvent) {
-    queue.async { self.listeners.forEach { $0(event) } }
-  }
+    public func emit(_ event: WalletEvent) {
+        queue.async { self.listeners.forEach { $0(event) } }
+    }
+    
+    // MARK: - Swift Concurrency Support
+    
+    /// Exposes events as an async stream so you can loop over them with 'for await'
+    public var values: AsyncStream<WalletEvent> {
+        AsyncStream { continuation in
+            // When a new subscription starts, we add a listener that forwards events to the stream
+            self.subscribe { event in
+                continuation.yield(event)
+            }
+            // Note: In a production app, you might want to handle unsubscription here,
+            // but for a singleton-like EventBus, this simple forwarding is sufficient.
+        }
+    }
 }

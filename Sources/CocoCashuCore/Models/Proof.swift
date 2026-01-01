@@ -3,10 +3,10 @@ import Foundation
 public struct Proof: Codable, Sendable, Identifiable, Hashable {
   public let id: ProofId
   public let amount: Int64
-  public let mint: MintURL
+  public var mint: MintURL
   public let secret: Data
-    public let C: String          // <--- ADD THIS
-      public let keysetId: String   // <--- ADD THIS
+  public var C: String
+  public var keysetId: String
   public var state: ProofState
   public let createdAt: Date
   public var reservedUntil: Date?

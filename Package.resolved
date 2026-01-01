@@ -1,6 +1,15 @@
 {
-  "originHash" : "bc0e5c948b362b3e0403a86b46591fdd5670a03292e7f94a8062fa9ae3e5b93f",
+  "originHash" : "cc0b91b53e911581b7a1342bc8f93dfe866f65c8b1f5463a6f6c9beea08853af",
   "pins" : [
+    {
+      "identity" : "bip39",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/pengpengliu/BIP39",
+      "state" : {
+        "revision" : "e79bd90275e50643cf8f97208ffa536d0def3ec7",
+        "version" : "1.0.1"
+      }
+    },
     {
       "identity" : "secp256k1.swift",
       "kind" : "remoteSourceControl",

@@ -38,8 +38,6 @@ public actor ProofService {
     if let m = proofsToAdd.first?.mint { events.emit(.proofsUpdated(mint: m)) }
   }
 
-  /// Demo-only spend that marks selected proofs as spent and creates local change.
-  /// NOTE: This is a local simulation for the demo app (no real Cashu protocol).
   public func spend(amount: Int64, from mint: MintURL) async throws {
     // 1) Pick largest-first unspent proofs to cover the amount
     var total: Int64 = 0
@@ -70,4 +68,8 @@ public actor ProofService {
         events.emit(.proofsUpdated(mint: mint))
       }
     
+    /// Returns unspent proofs. If mint is nil, returns unspent proofs for ALL mints.
+    public func getUnspent(mint: MintURL? = nil) async throws -> [Proof] {
+        try await proofs.fetchUnspent(mint: mint)
+    }
 }

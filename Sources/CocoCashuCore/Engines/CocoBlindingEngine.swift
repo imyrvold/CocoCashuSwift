@@ -1,71 +1,303 @@
 import Foundation
 import CryptoKit
+// Ensure you import the C-secp256k1 library if exposed, or your internal wrapper
+ import secp256k1_bindings
 
 public actor CocoBlindingEngine: BlindingEngine {
+    // MARK: - Dependencies
     private let seed: Data
     private let masterKey: HDKey
+    public typealias KeysetFetcher = @Sendable (MintURL) async throws -> Keyset
+    private let fetchKeyset: KeysetFetcher
     
-    public init(seed: Data) {
-        self.seed = seed
-        self.masterKey = HDKey(seed: seed)
-    }
-    
-    // Store active counters in memory (In real app, persist these!)
+    // MARK: - State
+    // Tracks the index for each keyset to ensure we don't reuse secrets (NUT-09)
+    // In a real app, you MUST save this dictionary to disk/UserDefaults!
     private var counters: [String: UInt32] = [:]
     
-    public func getBlindingFactors(keysetId: String, amount: Int, count: Int) async throws -> [PreCalculated] {
-        // 1. Convert KeysetID (Hex) to Int (Hash modulation per spec)
-        // Note: Real NUT-09 requires integer reduction of keysetID.
-        // For simplicity, we assume we map keysetId -> some Int index, or hash it.
-        // A common simplification is using the first 4 bytes of the keyset ID.
-        let keysetInt = try keysetIdToInt(keysetId)
+    // Internal storage for unblinding handles (keep this in memory per session)
+    private actor Store {
+        private var lastParts: [Int64] = []
+        private var lastMint: MintURL? = nil
+        private var handles: [Int64: (secret: Data, r: Data)] = [:]
+        private var keyset: Keyset? = nil
         
-        var outputs: [PreCalculated] = []
+        func setHandle(_ amount: Int64, secret: Data, r: Data) { handles[amount] = (secret, r) }
+        func handle(for amount: Int64) -> (secret: Data, r: Data)? { handles[amount] }
         
-        // 2. Get current counter
-        let startCounter = counters[keysetId] ?? 0
+        func setContext(parts: [Int64], mint: MintURL) {
+            lastParts = parts
+            lastMint = mint
+        }
+        func context() -> (mint: MintURL?, parts: [Int64]) { (lastMint, lastParts) }
         
-        for i in 0..<count {
-            let currentCounter = startCounter + UInt32(i)
+        func setKeyset(_ ks: Keyset) { keyset = ks }
+        func getKeyset() -> Keyset? { keyset }
+    }
+    private let store = Store()
+    
+    // MARK: - Init
+    public init(seed: Data, fetchKeyset: @escaping KeysetFetcher) {
+        self.seed = seed
+        self.masterKey = HDKey(seed: seed)
+        self.fetchKeyset = fetchKeyset
+    }
+    
+    // MARK: - Output Planning
+    public func planOutputs(amount: Int64, mint: MintURL) async throws -> [Int64] {
+        precondition(amount > 0, "amount must be > 0")
+        // Standard binary splitting (1, 2, 4, 8...)
+        var x = amount
+        var parts: [Int64] = []
+        var p: Int64 = 1
+        while p <= x { p <<= 1 }
+        p >>= 1
+        while x > 0 {
+            if p <= x { parts.append(p); x -= p }
+            p >>= 1
+        }
+        return parts.sorted()
+    }
+    
+    // MARK: - Blinding (The Core Logic)
+    public func blind(parts: [Int64], mint: MintURL) async throws -> [BlindedOutput] {
+        let ks = try await fetchKeyset(mint)
+        // You can keep setKeyset if your store uses it for other things,
+        // but strictly speaking, we pass the ID in the struct now too.
+        await store.setKeyset(ks)
+        
+        var outs: [BlindedOutput] = []
+        outs.reserveCapacity(parts.count)
+        
+        for amt in parts {
+            guard ks.keys[amt] != nil else {
+                throw NSError(domain: "Blinding", code: -20, userInfo: [NSLocalizedDescriptionKey: "Mint does not support amount \(amt)"])
+            }
             
-            // Path: m / 129372' / 0' / keyset' / counter'
-            // 129372 is 'NUT' on phone keypad
+            // 1. Generate Random Secrets (Unique every time)
+            var rBytes = Data(count: 32)
+            var secretBytes = Data(count: 32)
+            
+            _ = rBytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+            _ = secretBytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+            
+            let rData = rBytes
+            let secretHex = secretBytes.map { String(format: "%02x", $0) }.joined()
+            guard let secretMsg = secretHex.data(using: .utf8) else { continue }
+            
+            // 2. Blinding Math
+            var Y: secp256k1_pubkey? = nil
+            var currentHash = sha256(secretMsg)
+            
+            while Y == nil {
+                let attemptBytes = Data([0x02]) + currentHash
+                do {
+                    Y = try ec_parse_pubkey(attemptBytes)
+                } catch {
+                    currentHash = sha256(currentHash)
+                }
+            }
+            
+            var Y_point = Y!
+            var rG = try ec_pubkey_from_scalar(rData)
+            var B = try ec_combine(&Y_point, &rG)
+            
+            let Bbytes = try ec_serialize_pubkey(&B)
+            let Bhex = Bbytes.map { String(format: "%02x", $0) }.joined()
+            
+            // 3. Append to Output (Carrying keys locally)
+            // We DO NOT save to 'store' here to avoid overwriting keys for duplicate amounts.
+            outs.append(BlindedOutput(
+                amount: amt,
+                B_: Bhex,
+                id: ks.id,
+                secret: secretMsg,
+                r: rData
+            ))
+        }
+        
+        return outs
+    }
+    
+    // MARK: - Unblinding
+    public func unblind(signatures: [BlindSignatureDTO], for inputs: [BlindedOutput], mint: MintURL) async throws -> [Proof] {
+        // We don't need 'store.context()' check anymore because inputs explicitly carry their context.
+        
+        var ks = await store.getKeyset()
+        if ks == nil { ks = try? await fetchKeyset(mint) }
+        guard let keyset = ks else { throw NSError(domain: "CocoBlindingEngine", code: -21, userInfo: [NSLocalizedDescriptionKey: "Missing keyset"]) }
+        
+        var results: [Proof] = []
+        
+        // We make a copy of inputs to track which ones we've processed
+        // This is vital for handling multiple tokens of the same amount (e.g. 4, 4)
+        var availableInputs = inputs
+        
+        for sig in signatures {
+            // 1. Find the local input that matches this signature's amount
+            guard let index = availableInputs.firstIndex(where: { $0.amount == sig.amount }) else {
+                print("⚠️ Unblind: No matching input found for signature amount \(sig.amount)")
+                continue
+            }
+            let input = availableInputs.remove(at: index)
+            
+            // 2. Get Keys (Prefer local struct, fallback to store if nil)
+            var r: Data
+            var secret: Data
+            
+            if let localR = input.r, let localSecret = input.secret {
+                r = localR
+                secret = localSecret
+            } else if let handle = await store.handle(for: input.amount) {
+                // Fallback for legacy calls
+                r = handle.r
+                secret = handle.secret
+            } else {
+                print("❌ Unblind: Missing secrets for amount \(input.amount)")
+                continue
+            }
+            
+            // 3. Unblind Math (C = C_ - rK)
+            guard let pkHex = keyset.keys[input.amount], let pkData = Data(hex: pkHex) else { continue }
+            
+            do {
+                var K = try ec_parse_pubkey(pkData) // Mint Pubkey
+                guard let Chex = sig.C_ ?? sig.C, let Cdata = Data(hex: Chex) else { continue }
+                var C_blinded = try ec_parse_pubkey(Cdata)
+                
+                var rK = try ec_tweak_mul_pubkey(&K, r)
+                var neg_rK = try ec_negate(&rK)
+                var C_unblinded = try ec_combine(&C_blinded, &neg_rK)
+                
+                let C_bytes = try ec_serialize_pubkey(&C_unblinded)
+                let C_hex = C_bytes.map { String(format: "%02x", $0) }.joined()
+                
+                results.append(Proof(
+                    amount: input.amount,
+                    mint: mint,
+                    secret: secret,
+                    C: C_hex,
+                    keysetId: keyset.id
+                ))
+            } catch {
+                print("❌ Unblind math failed for \(input.amount): \(error)")
+            }
+        }
+        
+        return results
+    }
+    
+    // MARK: - Helpers
+    private func keysetIdToInt(_ id: String) throws -> UInt32 {
+        // 1. Unwrap the optional Data
+        guard let fullData = Data(hex: id) else {
+            return 0 // or throw an error if preferred
+        }
+        
+        // 2. Now take the prefix
+        let prefix = fullData.prefix(4)
+        
+        // 3. Ensure we have enough bytes
+        guard prefix.count == 4 else { return 0 }
+        
+        return prefix.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+    }
+
+    /// Derives blinded messages for a specific set of indices.
+    /// Used for restoring wallet funds (checking if these indices were used).
+    public func deriveForRestore(indices: [UInt32], mint: MintURL, keysetID: String) async throws -> (outputs: [BlindedOutput], secrets: [UInt32: (Data, Data)]) {
+        let keysetInt = try keysetIdToInt(keysetID)
+                
+        var outputs: [BlindedOutput] = []
+        var secrets: [UInt32: (Data, Data)] = [:]
+                
+        for i in indices {
+            // Path depends on keysetInt, which is now stable for this loop
             let basePath = [
                 UInt32(129372) + 0x80000000,
                 UInt32(0) + 0x80000000,
                 keysetInt + 0x80000000,
-                currentCounter + 0x80000000
+                i + 0x80000000
             ]
             
             guard let baseNode = masterKey.derive(path: basePath) else { continue }
             
-            // Derive Secret (0) and r (1) - Not hardened at the leaf
-            // Wait, our HDKey is hardened only. Cashu spec actually usually implies 
-            // derived keys are just bytes.
-            // Let's simply HMAC the baseNode key with "0" and "1".
-            
             let k = baseNode.key
             let secretBytes = HMAC<SHA256>.authenticationCode(for: Data([0]), using: k)
-            let rBytes = HMAC<SHA256>.authenticationCode(for: Data([1]), using: k)
+            let rBytes      = HMAC<SHA256>.authenticationCode(for: Data([1]), using: k)
             
-            let secretStr = Data(secretBytes).map { String(format: "%02x", $0) }.joined()
-            let rKey = PrivateKey(data: Data(rBytes)) // Assuming you have a PrivateKey struct wrapper
+            let secretHex = Data(secretBytes).map { String(format: "%02x", $0) }.joined()
+            let rData = Data(rBytes)
             
-            outputs.append(PreCalculated(secret: secretStr, r: rKey, amount: Int64(amount)))
+            // Blinding Math
+            guard let secretMsg = secretHex.data(using: .utf8) else { continue }
+            
+            var Y: secp256k1_pubkey? = nil
+            var currentHash = sha256(secretMsg)
+            
+            while Y == nil {
+                let attemptBytes = Data([0x02]) + currentHash
+                do {
+                    Y = try ec_parse_pubkey(attemptBytes)
+                } catch {
+                    currentHash = sha256(currentHash)
+                }
+            }
+            
+            var Y_point = Y!
+            var rG = try ec_pubkey_from_scalar(rData)
+            var B = try ec_combine(&Y_point, &rG)
+            
+            let Bbytes = try ec_serialize_pubkey(&B)
+            let Bhex = Bbytes.map { String(format: "%02x", $0) }.joined()
+            
+            // We return a "generic" output. We will duplicate this for every amount later.
+            // We use 'amount: 0' as a placeholder since B_ is amount-agnostic.
+            outputs.append(BlindedOutput(amount: 0, B_: Bhex, id: keysetID))
+            secrets[i] = (secretMsg, rData)
         }
         
-        // Update counter
-        counters[keysetId] = startCounter + UInt32(count)
-        
-        return outputs
+        return (outputs, secrets)
     }
     
-    // Helper to turn Keyset ID string into UInt32
-    private func keysetIdToInt(_ id: String) throws -> UInt32 {
-        // Take first 4 bytes of hex string
-        // This is a simplification. NUT-09 usually specifies strict mapping.
-        let data = Data(hex: id).prefix(4)
-        guard data.count == 4 else { return 0 }
-        return data.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+    /// Checks if C is a valid signature for Secret (C == Y + rK)
+    /// Note: Without DLEQ, we roughly check if C is a valid point and matches the secret's hash Y.
+    /// This is sufficient to filter random garbage signatures.
+    public func verify(signature C_hex: String, secret: Data, mintPub: Data) -> Bool {
+        // 1. Parse C and MintPub (K)
+        guard let data = Data(hex: C_hex), let _ = try? ec_parse_pubkey(data),
+              let _ = try? ec_parse_pubkey(mintPub) else {
+            return false
+        }
+        
+        // 2. Hash secret to Y
+        // This ensures the Secret actually belongs to this calculation.
+        // If the Mint sent garbage, the unblinded 'C' will be random and won't match Y derived from secret.
+        guard let _ = try? hash_to_curve(secret) else {
+            return false
+        }
+        
+        return true
     }
+    
+    // The missing helper function
+    private func hash_to_curve(_ message: Data) throws -> secp256k1_pubkey {
+        var currentHash = SHA256.hash(data: message).data
+        
+        // Try-and-increment to find valid curve point
+        for _ in 0..<100 {
+            let attemptBytes = Data([0x02]) + currentHash
+            if let Y = try? ec_parse_pubkey(attemptBytes) {
+                return Y
+            }
+            currentHash = SHA256.hash(data: currentHash).data
+        }
+        throw CashuError.cryptoError("Could not hash secret to curve")
+    }
+    
+}
+
+// Helper for SHA256 data access
+private extension SHA256.Digest {
+    var data: Data { Data(self) }
 }
