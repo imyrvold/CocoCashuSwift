@@ -411,7 +411,16 @@ public struct RealMintAPI: MintAPI, Sendable {
             let token: [Entry]
         }
         guard let root = try? JSONDecoder().decode(TokenRoot.self, from: data), let first = root.token.first else { return nil }
-        return first.proofs.map { Proof(amount: $0.amount, mint: mintURL, secret: Data(hex: $0.secret) ?? Data(), C: "", keysetId: "") }
+        return first.proofs.map {
+                Proof(
+                    amount: $0.amount,
+                    mint: mintURL,
+                    // FIX: Treat secret as UTF8 String, NOT Hex.
+                    secret: $0.secret.data(using: .utf8) ?? Data(),
+                    C: $0.C,
+                    keysetId: $0.id ?? ""
+                )
+            }
     }
     
     // Models for NUT-04 execution
@@ -512,26 +521,25 @@ public struct RealMintAPI: MintAPI, Sendable {
     }
     
     public func swap(mint: MintURL, inputs: [Proof], outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO] {
-        // 1. Prepare Inputs (Proofs to spend)
+        // 1. Prepare Inputs
         let inputDTOs: [[String: Any]] = inputs.map {
-            [
+            // This will now succeed because we fixed 'blind'
+            let secretStr = String(data: $0.secret, encoding: .utf8) ?? ""
+            
+            return [
                 "id": $0.keysetId,
                 "amount": $0.amount,
-                
-                // FIX: Convert Data back to String, don't use hexString.
-                // The secret is stored as UTF-8 bytes of the random string.
-                "secret": String(data: $0.secret, encoding: .utf8) ?? "",
-                
+                "secret": secretStr,
                 "C": $0.C
             ]
         }
         
-        // 2. Prepare Outputs (New tokens to create)
+        // 2. Prepare Outputs
         let outputDTOs: [[String: Any]] = outputs.map {
             [
-                "id": $0.id,
                 "amount": $0.amount,
-                "B_": $0.B_
+                "B_": $0.B_,
+                "id": $0.id
             ]
         }
         
@@ -543,21 +551,20 @@ public struct RealMintAPI: MintAPI, Sendable {
         // 3. Call API
         struct SwapResponse: Decodable {
             let signatures: [BlindSignatureDTO]?
-            
-            var all: [BlindSignatureDTO] { signatures ?? [] }
+            let promises: [BlindSignatureDTO]?
+            var all: [BlindSignatureDTO] { signatures ?? promises ?? [] }
         }
         
-        // 4. Call /v1/split
+        // Use your existing postJSON helper
         let r: SwapResponse = try await postJSON(SwapResponse.self, path: "/v1/swap", anyBody: payload)
         
-        // 5. Check results
         if r.all.isEmpty {
             throw CashuError.protocolError("Swap returned no signatures")
         }
         
-        // 4. Map to DTO
-        // Note: Swap signatures are blind (C_), so C is usually nil in the response.
-        return r.all
+        // 4. Map Response
+        // (Swap signatures are blind, so C is nil in response, we map C_ to C_).
+        return r.all.map { BlindSignatureDTO(amount: $0.amount, C_: $0.C_ ?? $0.C) }
     }
     
     /// Public helper to execute the minting step manually (NUT-04)

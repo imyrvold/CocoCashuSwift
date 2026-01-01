@@ -62,6 +62,10 @@ public actor ProofService {
     }
   }
     
+    public func remove(_ proofsToRemove: [Proof]) async throws {
+        try await proofs.delete(ids: proofsToRemove.map(\.id))
+    }
+    
     /// Unreserves proofs, making them available for spending again immediately.
       public func unreserve(_ ids: [ProofId], mint: MintURL) async throws {
         try await proofs.updateState(ids: ids, to: .unspent)

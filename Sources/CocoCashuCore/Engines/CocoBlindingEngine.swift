@@ -62,8 +62,6 @@ public actor CocoBlindingEngine: BlindingEngine {
     // MARK: - Blinding (The Core Logic)
     public func blind(parts: [Int64], mint: MintURL) async throws -> [BlindedOutput] {
         let ks = try await fetchKeyset(mint)
-        // You can keep setKeyset if your store uses it for other things,
-        // but strictly speaking, we pass the ID in the struct now too.
         await store.setKeyset(ks)
         
         var outs: [BlindedOutput] = []
@@ -74,7 +72,7 @@ public actor CocoBlindingEngine: BlindingEngine {
                 throw NSError(domain: "Blinding", code: -20, userInfo: [NSLocalizedDescriptionKey: "Mint does not support amount \(amt)"])
             }
             
-            // 1. Generate Random Secrets (Unique every time)
+            // 1. Generate Random Secret (Safe Hex String)
             var rBytes = Data(count: 32)
             var secretBytes = Data(count: 32)
             
@@ -82,10 +80,15 @@ public actor CocoBlindingEngine: BlindingEngine {
             _ = secretBytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
             
             let rData = rBytes
+            
+            // CRITICAL FIX: Convert random bytes to a Hex String.
+            // This ensures the secret is always valid UTF-8 characters (0-9, a-f).
             let secretHex = secretBytes.map { String(format: "%02x", $0) }.joined()
+            
+            // Convert that String back to Data (UTF-8) for storage
             guard let secretMsg = secretHex.data(using: .utf8) else { continue }
             
-            // 2. Blinding Math
+            // 2. Blinding Math (Hash-to-Curve)
             var Y: secp256k1_pubkey? = nil
             var currentHash = sha256(secretMsg)
             
@@ -105,13 +108,12 @@ public actor CocoBlindingEngine: BlindingEngine {
             let Bbytes = try ec_serialize_pubkey(&B)
             let Bhex = Bbytes.map { String(format: "%02x", $0) }.joined()
             
-            // 3. Append to Output (Carrying keys locally)
-            // We DO NOT save to 'store' here to avoid overwriting keys for duplicate amounts.
+            // 3. Append (With Local Secrets)
             outs.append(BlindedOutput(
                 amount: amt,
                 B_: Bhex,
                 id: ks.id,
-                secret: secretMsg,
+                secret: secretMsg, // This is now guaranteed to be valid UTF-8
                 r: rData
             ))
         }
@@ -128,40 +130,38 @@ public actor CocoBlindingEngine: BlindingEngine {
         guard let keyset = ks else { throw NSError(domain: "CocoBlindingEngine", code: -21, userInfo: [NSLocalizedDescriptionKey: "Missing keyset"]) }
         
         var results: [Proof] = []
+        var availableSigs = signatures // Copy to consume
         
         // We make a copy of inputs to track which ones we've processed
         // This is vital for handling multiple tokens of the same amount (e.g. 4, 4)
-        var availableInputs = inputs
         
-        for sig in signatures {
-            // 1. Find the local input that matches this signature's amount
-            guard let index = availableInputs.firstIndex(where: { $0.amount == sig.amount }) else {
-                print("⚠️ Unblind: No matching input found for signature amount \(sig.amount)")
+        // FIX: Iterate over INPUTS (Order Preserved), not signatures
+        for input in inputs {
+            // Find the signature matching this specific input amount
+            guard let sigIndex = availableSigs.firstIndex(where: { $0.amount == input.amount }) else {
+                print("❌ Unblind: Missing signature for amount \(input.amount)")
                 continue
             }
-            let input = availableInputs.remove(at: index)
+            let sig = availableSigs.remove(at: sigIndex)
             
-            // 2. Get Keys (Prefer local struct, fallback to store if nil)
+            // Retrieve Keys
             var r: Data
             var secret: Data
-            
             if let localR = input.r, let localSecret = input.secret {
                 r = localR
                 secret = localSecret
             } else if let handle = await store.handle(for: input.amount) {
-                // Fallback for legacy calls
                 r = handle.r
                 secret = handle.secret
             } else {
-                print("❌ Unblind: Missing secrets for amount \(input.amount)")
                 continue
             }
             
-            // 3. Unblind Math (C = C_ - rK)
+            // Unblind Math
             guard let pkHex = keyset.keys[input.amount], let pkData = Data(hex: pkHex) else { continue }
             
             do {
-                var K = try ec_parse_pubkey(pkData) // Mint Pubkey
+                var K = try ec_parse_pubkey(pkData)
                 guard let Chex = sig.C_ ?? sig.C, let Cdata = Data(hex: Chex) else { continue }
                 var C_blinded = try ec_parse_pubkey(Cdata)
                 
@@ -172,6 +172,7 @@ public actor CocoBlindingEngine: BlindingEngine {
                 let C_bytes = try ec_serialize_pubkey(&C_unblinded)
                 let C_hex = C_bytes.map { String(format: "%02x", $0) }.joined()
                 
+                // Append result (In correct order)
                 results.append(Proof(
                     amount: input.amount,
                     mint: mint,
@@ -180,10 +181,9 @@ public actor CocoBlindingEngine: BlindingEngine {
                     keysetId: keyset.id
                 ))
             } catch {
-                print("❌ Unblind math failed for \(input.amount): \(error)")
+                print("❌ Unblind math failed: \(error)")
             }
         }
-        
         return results
     }
     

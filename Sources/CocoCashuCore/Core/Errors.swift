@@ -7,6 +7,7 @@ public enum CashuError: Error, LocalizedError {
   case network(String)
   case protocolError(String)
   case cryptoError(String)
+  case invalidToken
 
     public var errorDescription: String? {
         switch self {
@@ -16,6 +17,7 @@ public enum CashuError: Error, LocalizedError {
         case .network(let msg): return "Network error: \(msg)"
         case .protocolError(let msg): return "Protocol error: \(msg)"
         case .cryptoError(let msg): return "Crypto error: \(msg)"
+        case .invalidToken: return "Invalid token."
         }
     }
 }
