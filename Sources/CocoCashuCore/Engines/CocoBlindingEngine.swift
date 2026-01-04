@@ -78,9 +78,7 @@ public actor CocoBlindingEngine: BlindingEngine {
             
             _ = rBytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
             _ = secretBytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
-            
-            let rData = rBytes
-            
+                        
             // CRITICAL FIX: Convert random bytes to a Hex String.
             // This ensures the secret is always valid UTF-8 characters (0-9, a-f).
             let secretHex = secretBytes.map { String(format: "%02x", $0) }.joined()
@@ -102,7 +100,7 @@ public actor CocoBlindingEngine: BlindingEngine {
             }
             
             var Y_point = Y!
-            var rG = try ec_pubkey_from_scalar(rData)
+            var rG = try ec_pubkey_from_scalar(rBytes)
             var B = try ec_combine(&Y_point, &rG)
             
             let Bbytes = try ec_serialize_pubkey(&B)
@@ -113,8 +111,8 @@ public actor CocoBlindingEngine: BlindingEngine {
                 amount: amt,
                 B_: Bhex,
                 id: ks.id,
-                secret: secretMsg, // This is now guaranteed to be valid UTF-8
-                r: rData
+                secret: secretMsg,
+                r: rBytes
             ))
         }
         
@@ -123,41 +121,19 @@ public actor CocoBlindingEngine: BlindingEngine {
     
     // MARK: - Unblinding
     public func unblind(signatures: [BlindSignatureDTO], for inputs: [BlindedOutput], mint: MintURL) async throws -> [Proof] {
-        // We don't need 'store.context()' check anymore because inputs explicitly carry their context.
         
         var ks = await store.getKeyset()
         if ks == nil { ks = try? await fetchKeyset(mint) }
-        guard let keyset = ks else { throw NSError(domain: "CocoBlindingEngine", code: -21, userInfo: [NSLocalizedDescriptionKey: "Missing keyset"]) }
+        guard let keyset = ks else { throw NSError(domain: "Blinding", code: -21, userInfo: [NSLocalizedDescriptionKey: "Missing keyset"]) }
         
         var results: [Proof] = []
-        var availableSigs = signatures // Copy to consume
+        var availableSigs = signatures
         
-        // We make a copy of inputs to track which ones we've processed
-        // This is vital for handling multiple tokens of the same amount (e.g. 4, 4)
-        
-        // FIX: Iterate over INPUTS (Order Preserved), not signatures
         for input in inputs {
-            // Find the signature matching this specific input amount
-            guard let sigIndex = availableSigs.firstIndex(where: { $0.amount == input.amount }) else {
-                print("❌ Unblind: Missing signature for amount \(input.amount)")
-                continue
-            }
+            guard let sigIndex = availableSigs.firstIndex(where: { $0.amount == input.amount }) else { continue }
             let sig = availableSigs.remove(at: sigIndex)
             
-            // Retrieve Keys
-            var r: Data
-            var secret: Data
-            if let localR = input.r, let localSecret = input.secret {
-                r = localR
-                secret = localSecret
-            } else if let handle = await store.handle(for: input.amount) {
-                r = handle.r
-                secret = handle.secret
-            } else {
-                continue
-            }
-            
-            // Unblind Math
+            guard let r = input.r, let secret = input.secret else { continue }
             guard let pkHex = keyset.keys[input.amount], let pkData = Data(hex: pkHex) else { continue }
             
             do {
@@ -172,18 +148,21 @@ public actor CocoBlindingEngine: BlindingEngine {
                 let C_bytes = try ec_serialize_pubkey(&C_unblinded)
                 let C_hex = C_bytes.map { String(format: "%02x", $0) }.joined()
                 
-                // Append result (In correct order)
+                // THE DECISION
+                let finalId = sig.id ?? input.id ?? keyset.id
+                
                 results.append(Proof(
                     amount: input.amount,
                     mint: mint,
                     secret: secret,
                     C: C_hex,
-                    keysetId: keyset.id
+                    keysetId: finalId
                 ))
             } catch {
                 print("❌ Unblind math failed: \(error)")
             }
         }
+        
         return results
     }
     

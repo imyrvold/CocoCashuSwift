@@ -133,25 +133,29 @@ public final class MintCoordinator {
         
         // 1. Parse the Token
         // We decode the string to get the proofs and the Mint URL.
-        let (proofsToSwap, mintUrl) = try parseToken(token)
+        let (proofs, mintUrl) = try parseToken(token)
         
-        let totalAmount = proofsToSwap.map { $0.amount }.reduce(0, +)
-        print("📥 RECEIVE: Found \(proofsToSwap.count) proofs worth \(totalAmount) sats. Mint: \(mintUrl)")
+        let totalAmount = proofs.reduce(0) { $0 + $1.amount }
+        let estimatedFee: Int64 = 1
+        let amountToReceive = totalAmount - estimatedFee
         
-        // 2. Plan and Blind (Generate NEW secrets for yourself)
-        // We are moving the money from the 'old' secrets (in the token) to 'new' secrets (in your wallet)
-        let parts = try await blinding.planOutputs(amount: totalAmount, mint: mintUrl)
+        guard amountToReceive > 0 else {
+            throw CashuError.cryptoError("Fee (\(estimatedFee)) exceeds token value (\(totalAmount))")
+        }
         
-        // 'blindedOutputs' contains your NEW private keys (secret & r)
-        let blindedOutputs = try await blinding.blind(parts: parts, mint: mintUrl)
+        print("📥 RECEIVE: Input \(totalAmount) - Fee \(estimatedFee) = \(amountToReceive) sats")
         
-        // 3. Network Swap
-        // We send the OLD proofs (inputs) and ask the Mint to sign our NEW blinded outputs.
-        // Ensure your RealMintAPI.swap accepts [BlindedOutput] as we fixed previously.
-        let signatures = try await api.swap(mint: mintUrl, inputs: proofsToSwap, outputs: blindedOutputs)
+        // 4. Split into powers of 2 (Standard Cashu Logic)
+        // e.g. If amountToReceive is 3, this returns [1, 2]
+        let outputAmounts = splitIntoPowersOf2(amountToReceive)
         
-        // 4. Unblind
-        // Match the Mint's signatures with your local blindedOutputs to create valid Proofs.
+        // 5. Blind
+        let blindedOutputs = try await blinding.blind(parts: outputAmounts, mint: mintUrl)
+        
+        // 6. Swap
+        let signatures = try await api.swap(mint: mintUrl, inputs: proofs, outputs: blindedOutputs)
+        
+        // 7. Unblind
         let newProofs = try await blinding.unblind(signatures: signatures, for: blindedOutputs, mint: mintUrl)
         
         // 5. Save to Wallet
@@ -159,8 +163,7 @@ public final class MintCoordinator {
         
         // 6. Update UI
         manager.events.emit(.proofsUpdated(mint: mintUrl))
-        
-        print("✅ RECEIVE COMPLETE: Added \(totalAmount) sats to wallet.")
+        print("✅ CLAIM COMPLETE: Added \(amountToReceive) sats to wallet.")
     }
     
     // MARK: - Token Parsing Helper
@@ -175,7 +178,7 @@ public final class MintCoordinator {
         let b64 = String(token[idx...])
             .replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
-        
+
         // Add padding if needed
         let padded = b64.padding(toLength: ((b64.count + 3) / 4) * 4, withPad: "=", startingAt: 0)
         
@@ -204,20 +207,39 @@ public final class MintCoordinator {
         guard let entry = root.token.first, let mintString = entry.mint, let url = URL(string: mintString) else {
             throw CashuError.invalidToken
         }
-        
+
         // 4. Convert to your App's Proof Model
-        let proofs = entry.proofs.map { p in
-            Proof(
+        let proofs = entry.proofs.compactMap { p -> Proof? in
+            var secretData = Data(base64Encoded: p.secret)
+            if secretData == nil {
+                secretData = p.secret.data(using: .utf8)
+            }
+            
+            guard let validSecret = secretData else { return nil }
+            
+            return Proof(
                 amount: p.amount,
                 mint: url,
                 // CRITICAL: Convert the secret string to Data (UTF8)
-                secret: p.secret.data(using: .utf8) ?? Data(),
+                secret: validSecret,
                 C: p.C,
                 keysetId: p.id ?? ""
             )
         }
-        
+
         return (proofs, url)
+    }
+    
+    private func splitIntoPowersOf2(_ amount: Int64) -> [Int64] {
+        var parts: [Int64] = []
+        var v = amount
+        var power: Int64 = 1
+        while v > 0 {
+            if (v & 1) == 1 { parts.append(power) }
+            v >>= 1
+            power <<= 1
+        }
+        return parts
     }
     
 }

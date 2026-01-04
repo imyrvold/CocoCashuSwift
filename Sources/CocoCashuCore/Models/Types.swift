@@ -37,10 +37,18 @@ public struct BlindedOutput: Sendable, Hashable {
 /// Blind signature (response) from the mint (NUT-04)
 /// Mints may return either `C_` or legacy `C` field name.
 public struct BlindSignatureDTO: Codable, Sendable, Hashable {
+  public let id: String?
   public let amount: Int64
   public let C_: String?
   public let C: String?
-  public init(amount: Int64, C_: String? = nil, C: String? = nil) { self.amount = amount; self.C_ = C_; self.C = C }
+    public init(amount: Int64, C_: String? = nil, C: String? = nil, id: String? = nil) { self.amount = amount; self.C_ = C_; self.C = C; self.id = id }
+    
+    enum CodingKeys: String, CodingKey {
+        case id
+        case amount
+        case C_
+        case C
+    }
 }
 
 /// Abstraction over the blinding / unblinding operations required by NUT-04.

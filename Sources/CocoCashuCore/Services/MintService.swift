@@ -35,56 +35,6 @@ public actor MintService {
     
     /// After invoice is paid, fetch minted proofs (receive tokens).
     
-    /*    public func receiveTokens(for quote: Quote) async throws {
-     print("⚡️ MINT: Attempting to claim quote \(quote.id) for \(quote.amount) sats...")
-     
-     // 1. Plan and Blind (Generate secrets)
-     // These 'blinded' structs hold the SECRETS in memory. We must not lose them.
-     let parts = try await blinding.planOutputs(amount: quote.amount, mint: quote.mint)
-     let blindedOutputs = try await blinding.blind(parts: parts, mint: quote.mint)
-     
-     // Convert to the DTO format the API expects
-     // (Assuming you resolved the struct differences from the previous step)
-     let apiInputs = blindedOutputs.map { BlindedOutput(amount: $0.amount, B_: $0.B_, id: $0.id) }
-     
-     var signatures: [BlindSignatureDTO] = []
-     
-     do {
-     // 2. Try to Mint normally
-     signatures = try await api.requestTokens(
-     quoteId: quote.id.uuidString,
-     blindedMessages: apiInputs,
-     mint: quote.mint
-     )
-     
-     } catch let error {
-     // 3. RECOVERY HANDLER
-     // Check if the error indicates "Already Signed" (Code 10002)
-     let errorString = String(describing: error)
-     if errorString.contains("already been signed") || errorString.contains("10002") {
-     print("⚠️ Network Glitch Detected: Mint already signed these outputs. Attempting RESTORE...")
-     
-     // Call RESTORE (NUT-05) to fetch the signatures we missed
-     signatures = try await api.restore(mint: quote.mint, outputs: apiInputs)
-     
-     print("✅ RESTORE SUCCESS: Recovered \(signatures.count) signatures!")
-     } else {
-     // Genuine failure (e.g. quote not paid yet)
-     throw error
-     }
-     }
-     
-     // 4. Unblind and Save (Standard flow)
-     // Now we have the signatures (either from the first try or the restore), so we can finish.
-     let proofs = try await blinding.unblind(signatures: signatures, for: parts, mint: quote.mint)
-     try await self.proofs.addNew(proofs)
-     
-     let total = proofs.map { $0.amount }.reduce(0, +)
-     await history.add(CashuTransaction(type: .mint, amount: total, memo: "Minted via Lightning", status: .success))
-     
-     print("✅ MINT: Success! Added \(total) sats.")
-     }*/
-    
     /// Spend tokens (melt) with Change handling
     public func spend(amount: Int64, from mint: MintURL, to destination: String) async throws {
         // 1. Get Quote & Fee Reserve
@@ -217,44 +167,6 @@ public actor MintService {
             return try TokenHelper.serialize(tokenProofs, mint: mint, memo: memo)
         }
     }
-    
-    /*    public func receiveToken(_ tokenString: String) async throws -> Int64 {
-     // 1. Parse
-     let tokenData = try TokenHelper.deserialize(tokenString)
-     guard let entry = tokenData.token.first, let mintURL = URL(string: entry.mint) else {
-     throw CashuError.protocolError("Invalid token format")
-     }
-     
-     let proofsToClaim = entry.proofs
-     let totalInput = proofsToClaim.map(\.amount).reduce(0, +)
-     
-     // FIX: Calculate fee dynamically (1 sat per proof)
-     // This handles "Strict" mints like cashu.cz
-     let swapFee: Int64 = 1
-     
-     let amountToReceive = totalInput - swapFee
-     
-     guard amountToReceive > 0 else {
-     throw CashuError.insufficientFunds
-     }
-     
-     // 2. Plan new outputs for the EXACT remaining amount (e.g. 10 - 1 = 9)
-     let newParts = try await blinding.planOutputs(amount: amountToReceive, mint: mintURL)
-     let blindedOutputs = try await blinding.blind(parts: newParts, mint: mintURL)
-     
-     // 3. Execute Swap
-     // Inputs (10) vs Outputs (9) + Fee (1). This will now balance.
-     let signatures = try await api.swap(mint: mintURL, inputs: proofsToClaim, outputs: blindedOutputs)
-     
-     // 4. Unblind & Store
-     let newProofs = try await blinding.unblind(signatures: signatures, for: newParts, mint: mintURL)
-     try await proofs.addNew(newProofs)
-     
-     // 5. History
-     await history.add(CashuTransaction(type: .mint, amount: amountToReceive, fee: swapFee, memo: "Received Token", status: .success))
-     
-     return amountToReceive
-     }*/
     
     /// Swaps specific proofs for a target amount (to send) + change.
     /// Returns: (change: [Proof], token: String)

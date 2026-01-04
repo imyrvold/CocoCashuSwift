@@ -93,7 +93,6 @@ public struct RealMintAPI: MintAPI, Sendable {
                     self.proofs = first.proofs; self.rawTokenString = nil; return
                 }
                 if let tokenString = try? c.decode(String.self, forKey: .token) { // cashuA... string
-                    print("RealMintAPI redeem: got string token (not parsed):", tokenString.prefix(32), "…")
                     self.proofs = []; self.rawTokenString = tokenString; return
                 }
             }
@@ -247,12 +246,11 @@ public struct RealMintAPI: MintAPI, Sendable {
     public func requestTokens(quoteId: String, blindedMessages: [BlindedOutput], mint: MintURL) async throws -> [BlindSignatureDTO] {
         
         // 1. Prepare Payload
-        // FIX: Add "id": $0.id to the dictionary. The Mint requires it.
         let outputsPayload = blindedMessages.map {
             [
                 "amount": $0.amount,
                 "B_": $0.B_,
-                "id": $0.id  // <-- THIS WAS MISSING
+                "id": $0.id
             ]
         }
         
@@ -273,7 +271,10 @@ public struct RealMintAPI: MintAPI, Sendable {
         return r.signatures.map { signature in
             BlindSignatureDTO(
                 amount: signature.amount,
-                C_: signature.C_
+                C_: signature.C_,
+                // FIX: Pass the ID from the mint response
+                // This ensures unblind() uses the correct keyset ID (00b4ec...)
+                id: signature.id
             )
         }
     }
@@ -355,10 +356,6 @@ public struct RealMintAPI: MintAPI, Sendable {
         req.httpBody = try JSONSerialization.data(withJSONObject: anyBody, options: [])
         let (data, resp) = try await session.data(for: req)
         try ensureOK(resp, url: url, data: data)
-        
-        if let debugStr = String(data: data, encoding: .utf8) {
-            print("🔍 RAW RESPONSE (\(path)): \(debugStr)")
-        }
         
         return try decodeJSON(T.self, data: data)
     }
@@ -523,48 +520,56 @@ public struct RealMintAPI: MintAPI, Sendable {
     public func swap(mint: MintURL, inputs: [Proof], outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO] {
         // 1. Prepare Inputs
         let inputDTOs: [[String: Any]] = inputs.map {
-            // This will now succeed because we fixed 'blind'
-            let secretStr = String(data: $0.secret, encoding: .utf8) ?? ""
+            let finalSecret: String
+            if let utf8Str = String(data: $0.secret, encoding: .utf8), !utf8Str.isEmpty {
+                finalSecret = utf8Str
+            } else {
+                // Attempt 2: If it's raw binary (not text), encode it to Base64
+                finalSecret = $0.secret.base64EncodedString()
+            }
             
-            return [
-                "id": $0.keysetId,
-                "amount": $0.amount,
-                "secret": secretStr,
-                "C": $0.C
-            ]
+            return ["id": $0.keysetId, "amount": $0.amount, "secret": finalSecret, "C": $0.C]
         }
-        
+
         // 2. Prepare Outputs
         let outputDTOs: [[String: Any]] = outputs.map {
-            [
-                "amount": $0.amount,
-                "B_": $0.B_,
-                "id": $0.id
-            ]
+            ["amount": $0.amount, "B_": $0.B_, "id": $0.id]
         }
-        
+
         let payload: [String: Any] = [
             "inputs": inputDTOs,
             "outputs": outputDTOs
         ]
-        
-        // 3. Call API
-        struct SwapResponse: Decodable {
-            let signatures: [BlindSignatureDTO]?
-            let promises: [BlindSignatureDTO]?
-            var all: [BlindSignatureDTO] { signatures ?? promises ?? [] }
+
+        struct PrivateSwapResponse: Decodable {
+            struct PrivateSignature: Decodable {
+                let amount: Int64
+                let C_: String?
+                let C: String?
+                let id: String?
+            }
+            
+            let signatures: [PrivateSignature]?
+            let promises: [PrivateSignature]?
+            var all: [PrivateSignature] { signatures ?? promises ?? [] }
         }
         
-        // Use your existing postJSON helper
-        let r: SwapResponse = try await postJSON(SwapResponse.self, path: "/v1/swap", anyBody: payload)
-        
+        let r: PrivateSwapResponse = try await postJSON(PrivateSwapResponse.self, path: "/v1/swap", anyBody: payload)
+
         if r.all.isEmpty {
             throw CashuError.protocolError("Swap returned no signatures")
         }
         
-        // 4. Map Response
-        // (Swap signatures are blind, so C is nil in response, we map C_ to C_).
-        return r.all.map { BlindSignatureDTO(amount: $0.amount, C_: $0.C_ ?? $0.C) }
+        // --- FIX IS HERE ---
+        // We must pass '$0.id' to the new struct so 'unblind' receives it.
+        return r.all.map { sig in
+            let blindSignatureDTO = BlindSignatureDTO(
+                amount: sig.amount,
+                C_: sig.C_ ?? sig.C,
+                id: sig.id
+            )
+            return blindSignatureDTO
+        }
     }
     
     /// Public helper to execute the minting step manually (NUT-04)
