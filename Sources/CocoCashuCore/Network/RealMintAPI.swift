@@ -448,33 +448,73 @@ public struct RealMintAPI: MintAPI, Sendable {
     // MARK: - Keys (NUT-01) for blinding
     
     struct KeysResponse: Decodable {
-        struct KeysetEntry: Decodable { let id: String?; let keys: [String:String] }
+        struct KeysetEntry: Decodable {
+            let id: String?
+            let keys: [String:String]
+            let input_fee_ppk: Int64?
+        }
         let keys: [String:String]?
         let keysets: [KeysetEntry]?
     }
     
+    // NUT-02: Response from /v1/keysets endpoint (keyset info with fees)
+    struct KeysetsInfoResponse: Decodable {
+        struct KeysetInfo: Decodable {
+            let id: String
+            let unit: String?
+            let active: Bool?
+            let input_fee_ppk: Int64?
+        }
+        let keysets: [KeysetInfo]
+    }
+    
     // Convert whatever the mint gives us into Keyset(amount:Int64 -> pubkeyHex)
     public func fetchKeyset() async throws -> Keyset {
+        // First try to get fee info from /v1/keysets
+        let feeInfo = try? await fetchKeysetFeeInfo()
+        
         let r: KeysResponse = try await getJSON(KeysResponse.self, path: "/v1/keys")
         if let ks = r.keysets?.first {
             let raw = ks.keys
             var map: [Int64:String] = [:]
             for (k,v) in raw { if let a = Int64(k) { map[a] = v } }
-            return Keyset(id: ks.id ?? baseURL.absoluteString, keys: map)
+            let keysetId = ks.id ?? baseURL.absoluteString
+            let fee = ks.input_fee_ppk ?? feeInfo?[keysetId] ?? 0
+            return Keyset(id: keysetId, keys: map, inputFeePPK: fee)
         }
         if let raw = r.keys {
             var map: [Int64:String] = [:]
             for (k,v) in raw { if let a = Int64(k) { map[a] = v } }
-            return Keyset(id: baseURL.absoluteString, keys: map)
+            let fee = feeInfo?.values.first ?? 0
+            return Keyset(id: baseURL.absoluteString, keys: map, inputFeePPK: fee)
         }
         // Some mints expose { "1": "02ab...", "2": "03cd...", ... } at the top level
         if let obj = try? await getRaw(path: "/v1/keys"),
            let top = try? JSONSerialization.jsonObject(with: obj) as? [String:Any] {
             var map: [Int64:String] = [:]
             for (k,v) in top { if let a = Int64(k), let s = v as? String { map[a] = s } }
-            if !map.isEmpty { return Keyset(id: baseURL.absoluteString, keys: map) }
+            if !map.isEmpty {
+                let fee = feeInfo?.values.first ?? 0
+                return Keyset(id: baseURL.absoluteString, keys: map, inputFeePPK: fee)
+            }
         }
         throw CashuError.protocolError("Mint /v1/keys did not contain a usable keyset")
+    }
+    
+    /// Fetch keyset fee info from /v1/keysets (NUT-02)
+    public func fetchKeysetFeeInfo() async throws -> [String: Int64] {
+        let r: KeysetsInfoResponse = try await getJSON(KeysetsInfoResponse.self, path: "/v1/keysets")
+        var feeMap: [String: Int64] = [:]
+        for ks in r.keysets {
+            feeMap[ks.id] = ks.input_fee_ppk ?? 0
+        }
+        return feeMap
+    }
+    
+    /// Check the fee for a specific number of inputs at this mint
+    public func checkFees(forInputCount numInputs: Int) async throws -> Int64 {
+        let keyset = try await fetchKeyset()
+        return keyset.calculateFee(forInputCount: numInputs)
     }
     
     public func fetchKeyset(mint: URL) async throws -> Keyset {

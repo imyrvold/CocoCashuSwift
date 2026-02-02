@@ -14,6 +14,12 @@ public protocol MintAPI: Sendable {
     func check(mint: URL, proofs: [ProofDTO]) async throws -> [CheckStateDTO]
     func fetchKeysetIds(mint: URL) async throws -> [String]
     func fetchKeyset(mint: URL, id: String) async throws -> Keyset
+    
+    /// NUT-02: Fetch the active keyset including fee information
+    func fetchKeyset() async throws -> Keyset
+    
+    /// NUT-02: Check the fee for a specific number of inputs
+    func checkFees(forInputCount numInputs: Int) async throws -> Int64
 }
 
 public actor MintService {
@@ -94,18 +100,19 @@ public actor MintService {
     /// Create a token string for a specific amount.
     /// This effectively "spends" the funds from your wallet and returns them as a token string.
     public func createToken(amount: Int64, from mint: MintURL, memo: String? = nil) async throws -> String {
-        // Estimate fee for the Inputs we are about to select.
-        // Since we don't know exactly how many inputs reserve() will pick,
-        // we start with a safe guess (e.g. 3 inputs = 3 sats).
-        let estimatedFee: Int64 = 3
+        // NUT-02: Fetch keyset to get dynamic fee info
+        let keyset = try await api.fetchKeyset()
+        
+        // Estimate fee for ~5 inputs as initial guess (will be refined after reserve)
+        let estimatedFee = keyset.calculateFee(forInputCount: 5)
         let inputs = try await proofs.reserve(amount: amount + estimatedFee, mint: mint)
         
         // 1. Reserve Amount + Fee
         do {
             let totalInput = inputs.map(\.amount).reduce(0, +)
             
-            // FIX: Refine the fee calculation based on actual inputs reserved
-            let actualFee = Int64(inputs.count) * 1 // 1 sat per input
+            // NUT-02: Calculate actual fee based on number of inputs and keyset fee
+            let actualFee = keyset.calculateFee(forInputCount: inputs.count)
             
             // Calculate change so everything balances EXACTLY
             // Available = Input - Fee. Token = amount. Change = Remainder.
@@ -177,11 +184,9 @@ public actor MintService {
         // 1. Calculate Input Total
         let totalInput = inputProofs.map(\.amount).reduce(0, +)
         
-        // FEE CALCULATION:
-        // The mint 'cashu.cz' is strict and charges fees (usually based on output count).
-        // The error log explicitly said "fees (1)".
-        // A safe heuristic for now is to reserve 2 or 3 sats, or just 1 as the log suggests.
-        let fee: Int64 = 1
+        // NUT-02: Calculate fee dynamically based on keyset fee info
+        let keyset = try await api.fetchKeyset()
+        let fee = keyset.calculateFee(forInputCount: inputProofs.count)
         
         // 2. Calculate Change
         // We must subtract the fee from the available money.
