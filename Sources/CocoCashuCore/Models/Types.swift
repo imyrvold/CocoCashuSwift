@@ -76,7 +76,21 @@ public protocol BlindingEngine: Sendable {
 public struct Keyset: Codable, Sendable, Hashable {
   public let id: String
   public let keys: [Int64: String] // amount -> pubkey (hex or bech)
-  public init(id: String, keys: [Int64: String]) { self.id = id; self.keys = keys }
+  public let inputFeePPK: Int64 // NUT-02: fee per input in parts per thousand (ppk)
+  
+  public init(id: String, keys: [Int64: String], inputFeePPK: Int64 = 0) {
+    self.id = id
+    self.keys = keys
+    self.inputFeePPK = inputFeePPK
+  }
+  
+  /// Calculate the fee for a given number of inputs based on input_fee_ppk
+  /// Formula: ceil((numInputs * inputFeePPK) / 1000)
+  public func calculateFee(forInputCount numInputs: Int) -> Int64 {
+    guard inputFeePPK > 0 else { return 0 }
+    let rawFee = Int64(numInputs) * inputFeePPK
+    return (rawFee + 999) / 1000 // Ceiling division
+  }
 }
 
 // MARK: - Small helpers
