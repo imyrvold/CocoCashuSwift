@@ -163,9 +163,9 @@ public actor MintService {
             
             // 7. Record History
             await history.add(CashuTransaction(
-                type: .melt,
+                type: .sendEcash,
                 amount: amount,
-                fee: actualFee, // Use the calculated fee
+                fee: actualFee,
                 memo: "Created Token",
                 status: .success
             ))
@@ -224,9 +224,11 @@ public actor MintService {
         
         try await self.proofs.addNew(changeProofs)
         try await self.proofs.remove(inputProofs)
-        
+
+        await history.add(CashuTransaction(type: .sendEcash, amount: amount, fee: fee, memo: "Sent Ecash", status: .success))
+
         let tokenString = try TokenHelper.serialize(tokenProofs, mint: mint)
-        
+
         return (change: changeProofs, token: tokenString)
     }
 }

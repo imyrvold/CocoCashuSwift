@@ -113,16 +113,18 @@ public final class MintCoordinator {
         // Use the 'manager' property to access proofService
         try await manager.proofService.addNew(proofs)
         
-        // Update UI
+        // Record history & update UI
         let total = proofs.map { $0.amount }.reduce(0, +)
+        await manager.history.add(CashuTransaction(type: .mint, amount: total, fee: 0, memo: "Minted via Lightning", status: .success))
         manager.events.emit(.proofsUpdated(mint: mint))
-        
+
         print("✅ MINT COMPLETE: Added \(total) sats to wallet.")
     }
     
     private func saveProofs(_ proofs: [Proof], mint: URL) async throws {
         try await manager.proofService.addNew(proofs)
-        // Emit event so UI updates immediately
+        let total = proofs.map { $0.amount }.reduce(0, +)
+        await manager.history.add(CashuTransaction(type: .mint, amount: total, fee: 0, memo: "Minted via Lightning", status: .success))
         manager.events.emit(.proofsUpdated(mint: mint))
     }
     
@@ -160,8 +162,9 @@ public final class MintCoordinator {
         
         // 5. Save to Wallet
         try await manager.proofService.addNew(newProofs)
-        
-        // 6. Update UI
+
+        // 6. Record history & update UI
+        await manager.history.add(CashuTransaction(type: .receiveEcash, amount: amountToReceive, fee: estimatedFee, memo: "Received Ecash", status: .success))
         manager.events.emit(.proofsUpdated(mint: mintUrl))
         print("✅ CLAIM COMPLETE: Added \(amountToReceive) sats to wallet.")
     }

@@ -1,8 +1,10 @@
 import Foundation
 
 public enum TransactionType: String, Codable, Sendable {
-    case mint   // Incoming (Lightning -> Cashu)
-    case melt   // Outgoing (Cashu -> Lightning)
+    case mint        // Incoming (Lightning -> Cashu)
+    case melt        // Outgoing (Cashu -> Lightning)
+    case sendEcash   // Outgoing (Cashu -> Ecash token)
+    case receiveEcash // Incoming (Ecash token -> Cashu)
 }
 
 public struct CashuTransaction: Codable, Sendable, Identifiable {
