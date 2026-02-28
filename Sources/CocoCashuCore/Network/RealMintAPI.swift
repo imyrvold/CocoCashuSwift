@@ -291,7 +291,13 @@ public struct RealMintAPI: MintAPI, Sendable {
     
     public func executeMelt(mint: MintURL, quoteId: String, inputs: [Proof], outputs: [BlindedOutput]) async throws -> (preimage: String, change: [BlindSignatureDTO]?) {
         let inputDTOs: [[String: Any]] = inputs.map {
-            ["id": $0.keysetId, "amount": $0.amount, "secret": $0.secret.hexString, "C": $0.C]
+            let finalSecret: String
+            if let utf8Str = String(data: $0.secret, encoding: .utf8), !utf8Str.isEmpty {
+                finalSecret = utf8Str
+            } else {
+                finalSecret = $0.secret.base64EncodedString()
+            }
+            return ["id": $0.keysetId, "amount": $0.amount, "secret": finalSecret, "C": $0.C]
         }
         let outputDTOs: [[String: Any]] = outputs.map {
             ["id": $0.id, "amount": $0.amount, "B_": $0.B_]
