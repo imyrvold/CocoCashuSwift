@@ -9,12 +9,12 @@ public actor CocoBlindingEngine: BlindingEngine {
     private let masterKey: HDKey
     public typealias KeysetFetcher = @Sendable (MintURL) async throws -> Keyset
     private let fetchKeyset: KeysetFetcher
-    
-    // MARK: - State
-    // Tracks the index for each keyset to ensure we don't reuse secrets (NUT-09)
-    // In a real app, you MUST save this dictionary to disk/UserDefaults!
-    private var counters: [String: UInt32] = [:]
-    
+
+    // Persistent NUT-13 derivation counter, scoped per keyset. Reserving indices
+    // here (instead of using random secrets) is what makes minted proofs
+    // recoverable by seed-based restore — and what prevents secret reuse.
+    private let counterRepo: CounterRepository
+
     // Internal storage for unblinding handles (keep this in memory per session)
     private actor Store {
         private var lastParts: [Int64] = []
@@ -37,9 +37,10 @@ public actor CocoBlindingEngine: BlindingEngine {
     private let store = Store()
     
     // MARK: - Init
-    public init(seed: Data, fetchKeyset: @escaping KeysetFetcher) {
+    public init(seed: Data, counterRepo: CounterRepository, fetchKeyset: @escaping KeysetFetcher) {
         self.seed = seed
         self.masterKey = HDKey(seed: seed)
+        self.counterRepo = counterRepo
         self.fetchKeyset = fetchKeyset
     }
     
@@ -63,49 +64,37 @@ public actor CocoBlindingEngine: BlindingEngine {
     public func blind(parts: [Int64], mint: MintURL) async throws -> [BlindedOutput] {
         let ks = try await fetchKeyset(mint)
         await store.setKeyset(ks)
-        
-        var outs: [BlindedOutput] = []
-        outs.reserveCapacity(parts.count)
-        
+
+        // Validate all denominations are supported BEFORE reserving any counter
+        // indices, so a bad request doesn't burn (skip) derivation indices.
         for amt in parts {
             guard ks.keys[amt] != nil else {
                 throw NSError(domain: "Blinding", code: -20, userInfo: [NSLocalizedDescriptionKey: "Mint does not support amount \(amt)"])
             }
-            
-            // 1. Generate Random Secret (Safe Hex String)
-            var rBytes = Data(count: 32)
-            var secretBytes = Data(count: 32)
-            
-            _ = rBytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
-            _ = secretBytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
-                        
-            // CRITICAL FIX: Convert random bytes to a Hex String.
-            // This ensures the secret is always valid UTF-8 characters (0-9, a-f).
-            let secretHex = secretBytes.map { String(format: "%02x", $0) }.joined()
-            
-            // Convert that String back to Data (UTF-8) for storage
-            guard let secretMsg = secretHex.data(using: .utf8) else { continue }
-            
-            // 2. Blinding Math (Hash-to-Curve)
-            var Y: secp256k1_pubkey? = nil
-            var currentHash = sha256(secretMsg)
-            
-            while Y == nil {
-                let attemptBytes = Data([0x02]) + currentHash
-                do {
-                    Y = try ec_parse_pubkey(attemptBytes)
-                } catch {
-                    currentHash = sha256(currentHash)
-                }
-            }
-            
-            var Y_point = Y!
+        }
+
+        // Reserve a contiguous block of NUT-13 indices for this keyset. The
+        // repository persists the advance, so these indices are never reused.
+        let startIndex = try await counterRepo.reserve(key: ks.id, count: parts.count)
+
+        var outs: [BlindedOutput] = []
+        outs.reserveCapacity(parts.count)
+
+        for (offset, amt) in parts.enumerated() {
+            let index = UInt32(truncatingIfNeeded: startIndex + Int64(offset))
+
+            // 1. Deterministically derive secret + blinding factor r from the seed
+            //    (must match deriveForRestore so restore can rediscover this proof).
+            let (secretMsg, rBytes) = try deriveSecretAndR(keysetID: ks.id, index: index)
+
+            // 2. Blinding Math (Hash-to-Curve): B_ = Y + r*G
+            var Y_point = try hash_to_curve(secretMsg)
             var rG = try ec_pubkey_from_scalar(rBytes)
             var B = try ec_combine(&Y_point, &rG)
-            
+
             let Bbytes = try ec_serialize_pubkey(&B)
             let Bhex = Bbytes.map { String(format: "%02x", $0) }.joined()
-            
+
             // 3. Append (With Local Secrets)
             outs.append(BlindedOutput(
                 amount: amt,
@@ -115,8 +104,33 @@ public actor CocoBlindingEngine: BlindingEngine {
                 r: rBytes
             ))
         }
-        
+
         return outs
+    }
+
+    /// NUT-13 deterministic derivation of (secret message, blinding factor r) for a
+    /// given keyset and index. Path: m/129372'/0'/{keyset}'/{index}', with
+    /// secret = HMAC(k, 0x00) and r = HMAC(k, 0x01). Shared by `blind` and
+    /// `deriveForRestore` so minting and restoration always agree.
+    private func deriveSecretAndR(keysetID: String, index: UInt32) throws -> (secret: Data, r: Data) {
+        let keysetInt = try keysetIdToInt(keysetID)
+        let path = [
+            UInt32(129372) + 0x80000000,
+            UInt32(0) + 0x80000000,
+            keysetInt + 0x80000000,
+            index + 0x80000000
+        ]
+        guard let node = masterKey.derive(path: path) else {
+            throw CashuError.cryptoError("HD derivation failed for index \(index)")
+        }
+        let k = node.key
+        let secretBytes = HMAC<SHA256>.authenticationCode(for: Data([0]), using: k)
+        let rBytes = HMAC<SHA256>.authenticationCode(for: Data([1]), using: k)
+        let secretHex = Data(secretBytes).map { String(format: "%02x", $0) }.joined()
+        guard let secretMsg = secretHex.data(using: .utf8) else {
+            throw CashuError.cryptoError("Could not encode derived secret")
+        }
+        return (secretMsg, Data(rBytes))
     }
     
     // MARK: - Unblinding
@@ -185,57 +199,28 @@ public actor CocoBlindingEngine: BlindingEngine {
     /// Derives blinded messages for a specific set of indices.
     /// Used for restoring wallet funds (checking if these indices were used).
     public func deriveForRestore(indices: [UInt32], mint: MintURL, keysetID: String) async throws -> (outputs: [BlindedOutput], secrets: [UInt32: (Data, Data)]) {
-        let keysetInt = try keysetIdToInt(keysetID)
-                
         var outputs: [BlindedOutput] = []
         var secrets: [UInt32: (Data, Data)] = [:]
-                
+
         for i in indices {
-            // Path depends on keysetInt, which is now stable for this loop
-            let basePath = [
-                UInt32(129372) + 0x80000000,
-                UInt32(0) + 0x80000000,
-                keysetInt + 0x80000000,
-                i + 0x80000000
-            ]
-            
-            guard let baseNode = masterKey.derive(path: basePath) else { continue }
-            
-            let k = baseNode.key
-            let secretBytes = HMAC<SHA256>.authenticationCode(for: Data([0]), using: k)
-            let rBytes      = HMAC<SHA256>.authenticationCode(for: Data([1]), using: k)
-            
-            let secretHex = Data(secretBytes).map { String(format: "%02x", $0) }.joined()
-            let rData = Data(rBytes)
-            
-            // Blinding Math
-            guard let secretMsg = secretHex.data(using: .utf8) else { continue }
-            
-            var Y: secp256k1_pubkey? = nil
-            var currentHash = sha256(secretMsg)
-            
-            while Y == nil {
-                let attemptBytes = Data([0x02]) + currentHash
-                do {
-                    Y = try ec_parse_pubkey(attemptBytes)
-                } catch {
-                    currentHash = sha256(currentHash)
-                }
-            }
-            
-            var Y_point = Y!
+            // Same deterministic derivation as `blind`, so a minted proof at this
+            // index produces an identical blinded message here during restore.
+            let (secretMsg, rData) = try deriveSecretAndR(keysetID: keysetID, index: i)
+
+            // Blinding Math: B_ = Y + r*G
+            var Y_point = try hash_to_curve(secretMsg)
             var rG = try ec_pubkey_from_scalar(rData)
             var B = try ec_combine(&Y_point, &rG)
-            
+
             let Bbytes = try ec_serialize_pubkey(&B)
             let Bhex = Bbytes.map { String(format: "%02x", $0) }.joined()
-            
+
             // We return a "generic" output. We will duplicate this for every amount later.
             // We use 'amount: 0' as a placeholder since B_ is amount-agnostic.
             outputs.append(BlindedOutput(amount: 0, B_: Bhex, id: keysetID))
             secrets[i] = (secretMsg, rData)
         }
-        
+
         return (outputs, secrets)
     }
     
@@ -259,21 +244,29 @@ public actor CocoBlindingEngine: BlindingEngine {
         return true
     }
     
-    // The missing helper function
-    private func hash_to_curve(_ message: Data) throws -> secp256k1_pubkey {
-        var currentHash = SHA256.hash(data: message).data
-        
-        // Try-and-increment to find valid curve point
-        for _ in 0..<100 {
-            let attemptBytes = Data([0x02]) + currentHash
+    /// NUT-00 hash-to-curve. MUST match the mint exactly or proofs never verify:
+    ///   msg  = sha256("Secp256k1_HashToCurve_Cashu_" || x)
+    ///   Y    = lift_x(0x02 || sha256(msg || counter_le32)), incrementing counter
+    ///          until a valid x-coordinate is found.
+    /// (The earlier sha256(x)-with-no-domain-separator version is the deprecated
+    /// pre-2023 scheme and is incompatible with modern mints.)
+    private static let hashToCurveDomain = Data("Secp256k1_HashToCurve_Cashu_".utf8)
+
+    func hash_to_curve(_ message: Data) throws -> secp256k1_pubkey {
+        let msgHash = sha256(Self.hashToCurveDomain + message)
+        var counter: UInt32 = 0
+        while counter < 1_000 {
+            var toHash = msgHash
+            withUnsafeBytes(of: counter.littleEndian) { toHash.append(contentsOf: $0) }
+            let attemptBytes = Data([0x02]) + sha256(toHash)
             if let Y = try? ec_parse_pubkey(attemptBytes) {
                 return Y
             }
-            currentHash = SHA256.hash(data: currentHash).data
+            counter += 1
         }
         throw CashuError.cryptoError("Could not hash secret to curve")
     }
-    
+
 }
 
 // Helper for SHA256 data access

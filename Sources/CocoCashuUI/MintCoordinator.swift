@@ -138,35 +138,62 @@ public final class MintCoordinator {
         let (proofs, mintUrl) = try parseToken(token)
         
         let totalAmount = proofs.reduce(0) { $0 + $1.amount }
-        let estimatedFee: Int64 = 1
+
+        // NUT-02: the swap fee is dictated by the keyset's input_fee_ppk, not a fixed
+        // guess. Hardcoding 1 made outputs short by 1 on zero-fee mints (e.g. cashu.cz),
+        // so the mint rejected the swap as "not balanced" (code 11000).
+        let keyset = try await api.fetchKeyset()
+        let estimatedFee = keyset.calculateFee(forInputCount: proofs.count)
         let amountToReceive = totalAmount - estimatedFee
-        
+
         guard amountToReceive > 0 else {
             throw CashuError.cryptoError("Fee (\(estimatedFee)) exceeds token value (\(totalAmount))")
         }
-        
+
         print("📥 RECEIVE: Input \(totalAmount) - Fee \(estimatedFee) = \(amountToReceive) sats")
         
         // 4. Split into powers of 2 (Standard Cashu Logic)
         // e.g. If amountToReceive is 3, this returns [1, 2]
         let outputAmounts = splitIntoPowersOf2(amountToReceive)
-        
-        // 5. Blind
-        let blindedOutputs = try await blinding.blind(parts: outputAmounts, mint: mintUrl)
-        
-        // 6. Swap
-        let signatures = try await api.swap(mint: mintUrl, inputs: proofs, outputs: blindedOutputs)
-        
-        // 7. Unblind
-        let newProofs = try await blinding.unblind(signatures: signatures, for: blindedOutputs, mint: mintUrl)
-        
-        // 5. Save to Wallet
-        try await manager.proofService.addNew(newProofs)
 
-        // 6. Record history & update UI
-        await manager.history.add(CashuTransaction(type: .receiveEcash, amount: amountToReceive, fee: estimatedFee, memo: "Received Ecash", status: .success))
-        manager.events.emit(.proofsUpdated(mint: mintUrl))
-        print("✅ CLAIM COMPLETE: Added \(amountToReceive) sats to wallet.")
+        // 5-7. Blind → Swap → Unblind, with self-healing on output collisions.
+        // If the mint reports our blinded outputs as already-signed/pending (NUT-13
+        // index reuse, e.g. after a counter reset), re-derive with fresh indices and
+        // retry — each blind() reserves a new counter range, so the outputs differ.
+        let maxAttempts = 8
+        var lastError: Error?
+        for attempt in 1...maxAttempts {
+            do {
+                let blindedOutputs = try await blinding.blind(parts: outputAmounts, mint: mintUrl)
+                let signatures = try await api.swap(mint: mintUrl, inputs: proofs, outputs: blindedOutputs)
+                let newProofs = try await blinding.unblind(signatures: signatures, for: blindedOutputs, mint: mintUrl)
+
+                try await manager.proofService.addNew(newProofs)
+                await manager.history.add(CashuTransaction(type: .receiveEcash, amount: amountToReceive, fee: estimatedFee, memo: "Received Ecash", status: .success))
+                manager.events.emit(.proofsUpdated(mint: mintUrl))
+                print("✅ CLAIM COMPLETE: Added \(amountToReceive) sats to wallet.")
+                return
+            } catch {
+                lastError = error
+                if Self.isOutputCollision(error), attempt < maxAttempts {
+                    print("⚠️ RECEIVE: outputs collided (attempt \(attempt)/\(maxAttempts)) — retrying with fresh derivation indices…")
+                    continue
+                }
+                throw error
+            }
+        }
+        throw lastError ?? CashuError.network("Receive failed after \(maxAttempts) attempts")
+    }
+
+    /// True when the mint rejects our *outputs* as already-signed or pending
+    /// (NUT-13 index reuse), which a fresh re-derivation can recover from.
+    private static func isOutputCollision(_ error: Error) -> Bool {
+        let s = String(describing: error).lowercased()
+        return s.contains("11004")               // outputs are pending
+            || s.contains("10002")               // blinded message already signed
+            || s.contains("outputs are pending")
+            || s.contains("already signed")
+            || s.contains("already been signed")
     }
     
     // MARK: - Token Parsing Helper

@@ -49,7 +49,17 @@ public final class SeedManager: @unchecked Sendable {
         SecItemAdd(query as CFDictionary, nil)
     }
     
-    // 5. Retrieve
+    // 5. Delete (used by wallet reset)
+    public func deleteFromKeychain() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "master_seed"
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    // 6. Retrieve
     public func retrieveFromKeychain() -> [String]? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

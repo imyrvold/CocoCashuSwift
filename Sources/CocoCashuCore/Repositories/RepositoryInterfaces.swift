@@ -23,6 +23,14 @@ public protocol QuoteRepository: Sendable {
   func fetchPending(mint: MintURL?) async throws -> [Quote]
 }
 
+/// Tracks the NUT-13 deterministic-secret derivation index per keyset scope.
+/// Indices start at 0 and must NEVER be reused, otherwise the same secret is
+/// derived twice and the mint rejects the duplicate (or funds become ambiguous).
+/// Implementations must persist the advance durably before returning from `reserve`.
 public protocol CounterRepository: Sendable {
-  func nextCounter(key: String) async throws -> Int64
+  /// The next unused derivation index for a scope (0 if the scope is new).
+  func current(key: String) async throws -> Int64
+  /// Atomically reserve `count` consecutive indices and return the first one,
+  /// persisting the advance before returning.
+  func reserve(key: String, count: Int) async throws -> Int64
 }

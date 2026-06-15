@@ -12,7 +12,9 @@ let package = Package(
   ],
   dependencies: [
     .package(url: "https://github.com/GigaBitcoin/secp256k1.swift", exact: "0.2.0"),
-    .package(url: "https://github.com/pengpengliu/BIP39", from: "1.0.0")
+    // Pinned: SeedManager uses the 1.0.1 Mnemonic API (non-throwing init, `seed: [UInt8]`).
+    // 1.0.2 changed that API, so allowing it to float breaks the build.
+    .package(url: "https://github.com/pengpengliu/BIP39", exact: "1.0.1")
   ],
   targets: [
     .target(

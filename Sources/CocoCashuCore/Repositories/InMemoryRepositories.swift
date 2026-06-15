@@ -111,7 +111,41 @@ public actor InMemoryQuoteRepository: QuoteRepository {
 public actor InMemoryCounterRepository: CounterRepository {
   private var counters: [String: Int64] = [:]
   public init() {}
-  public func nextCounter(key: String) async throws -> Int64 {
-    let next = (counters[key] ?? 0) + 1; counters[key] = next; return next
+  public func current(key: String) async throws -> Int64 { counters[key] ?? 0 }
+  public func reserve(key: String, count: Int) async throws -> Int64 {
+    let start = counters[key] ?? 0
+    counters[key] = start + Int64(count)
+    return start
+  }
+}
+
+/// Disk-backed counter repository that persists derivation indices atomically.
+/// Use this in production so NUT-13 indices survive app restarts and are never reused.
+public actor FileCounterRepository: CounterRepository {
+  private let url: URL
+  private var counters: [String: Int64]
+
+  public init(url: URL) {
+    self.url = url
+    if let data = try? Data(contentsOf: url),
+       let decoded = try? JSONDecoder().decode([String: Int64].self, from: data) {
+      self.counters = decoded
+    } else {
+      self.counters = [:]
+    }
+  }
+
+  public func current(key: String) async throws -> Int64 { counters[key] ?? 0 }
+
+  public func reserve(key: String, count: Int) async throws -> Int64 {
+    let start = counters[key] ?? 0
+    counters[key] = start + Int64(count)
+    try persist()
+    return start
+  }
+
+  private func persist() throws {
+    let data = try JSONEncoder().encode(counters)
+    try data.write(to: url, options: .atomic)
   }
 }

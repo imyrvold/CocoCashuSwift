@@ -74,10 +74,11 @@ public actor MintService {
             }
             
             let (_, changeSigs) = try await api.executeMelt(mint: mint, quoteId: quoteId, inputs: inputs, outputs: outputs)
-            
+
             if let sigs = changeSigs, !sigs.isEmpty, !changeParts.isEmpty {
-                let allBlinded = try await blinding.blind(parts: changeParts, mint: mint)
-                let changeProofs = try await blinding.unblind(signatures: sigs, for: allBlinded, mint: mint)
+                // Unblind against the SAME outputs we sent to the mint — re-blinding
+                // here would derive different secrets and corrupt the change proofs.
+                let changeProofs = try await blinding.unblind(signatures: sigs, for: outputs, mint: mint)
                 try await proofs.addNew(changeProofs)
             }
             
@@ -132,14 +133,14 @@ public actor MintService {
             // Blind everything
             let allParts = tokenParts + changeParts
             
-            // 2. Blind ONCE
+            // 2. Blind ONCE (blinding twice would derive a second, different set of
+            //    secrets and unblind against the wrong factors, producing invalid proofs).
             let allOutputs = try await blinding.blind(parts: allParts, mint: mint)
-            
+
             // 3. Swap
-            let allBlinded = try await blinding.blind(parts: allParts, mint: mint)
             let signatures = try await api.swap(mint: mint, inputs: inputs, outputs: allOutputs)
-            // 4. Unblind Everything
-            let allProofs = try await blinding.unblind(signatures: signatures, for: allBlinded, mint: mint)
+            // 4. Unblind Everything (against the SAME outputs we sent)
+            let allProofs = try await blinding.unblind(signatures: signatures, for: allOutputs, mint: mint)
             
             // 5. Split the results back into Token vs Change
             // We know the first N proofs correspond to the tokenParts

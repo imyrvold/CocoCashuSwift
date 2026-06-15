@@ -62,7 +62,23 @@ public struct RealMintAPI: MintAPI, Sendable {
         }
     }
     
-    struct StatusResponse: Decodable { public let paid: Bool }
+    /// Tolerant mint-quote status decode. Legacy mints return `{"paid": bool}`;
+    /// modern NUT-04 mints return `{"state": "UNPAID"|"PAID"|"ISSUED"}` and no `paid`.
+    struct StatusResponse: Decodable {
+        public let paid: Bool
+        enum CodingKeys: String, CodingKey { case paid, state }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            if let p = try? c.decode(Bool.self, forKey: .paid) {
+                paid = p
+            } else if let s = try? c.decode(String.self, forKey: .state) {
+                let up = s.uppercased()
+                paid = (up == "PAID" || up == "ISSUED")
+            } else {
+                paid = false
+            }
+        }
+    }
     
     struct MintTokenResponse: Decodable {
         struct MintProof: Decodable {
@@ -121,9 +137,10 @@ public struct RealMintAPI: MintAPI, Sendable {
     
     struct MeltResponse: Decodable {
         let paid: Bool
+        let state: String?
         let preimage: String?
         let change: [ChangeSig]?
-        
+
         // Helper struct representing the Mint's change response (NUT-05)
         struct ChangeSig: Decodable {
             let amount: Int64
@@ -131,18 +148,26 @@ public struct RealMintAPI: MintAPI, Sendable {
             let C_: String? // Some mints use C, some C_
             let id: String?
         }
-        
+
         private enum CodingKeys: String, CodingKey {
             case paid
+            case state                 // modern NUT-05: "UNPAID"|"PENDING"|"PAID"
             case preimage              // some mints use this
             case payment_preimage      // cashu v1 uses this
             case change
         }
-        
+
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
-            paid = (try? c.decode(Bool.self, forKey: .paid)) ?? false
-            
+            // Legacy mints return `paid: Bool`; modern NUT-05 returns `state: "PAID"`.
+            let rawState = (try? c.decode(String.self, forKey: .state))
+            state = rawState
+            if let p = try? c.decode(Bool.self, forKey: .paid) {
+                paid = p
+            } else {
+                paid = (rawState?.uppercased() == "PAID")
+            }
+
             if let p = try? c.decode(String.self, forKey: .preimage) {
                 preimage = p
             } else if let p = try? c.decode(String.self, forKey: .payment_preimage) {
@@ -310,10 +335,13 @@ public struct RealMintAPI: MintAPI, Sendable {
         ]
         
         let r: MeltResponse = try await postJSON(MeltResponse.self, path: "/v1/melt/bolt11", anyBody: payload)
-        
-        guard r.paid, let pre = r.preimage else {
-            throw CashuError.protocolError("Melt not paid")
+
+        guard r.paid else {
+            throw CashuError.protocolError("Melt not paid (state: \(r.state ?? "unknown"))")
         }
+        // When paid, the inputs are already spent at the mint. Don't fail the whole
+        // operation just because a preimage wasn't included (some internal/MPP pays omit it).
+        let pre = r.preimage ?? ""
         
         // Map change output (Blind Signatures)
         let changeSigs: [BlindSignatureDTO]? = r.change?.map { mp in
