@@ -147,6 +147,7 @@ public struct RealMintAPI: MintAPI, Sendable {
             let C: String?
             let C_: String? // Some mints use C, some C_
             let id: String?
+            let dleq: DLEQProof?
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -180,7 +181,7 @@ public struct RealMintAPI: MintAPI, Sendable {
                 do {
                     change = try c.decode([ChangeSig].self, forKey: .change)
                 } catch {
-                    print("❌ DECODING ERROR for 'change': \(error)")
+                    cocoLog("❌ DECODING ERROR for 'change': \(error)")
                     change = nil
                 }
             } else {
@@ -192,26 +193,27 @@ public struct RealMintAPI: MintAPI, Sendable {
     // MARK: - MintAPI
     
     public func requestMintQuote(mint: MintURL, amount: Int64) async throws -> (invoice: String, expiresAt: Date?, quoteId: String?) {
-        let _ : InfoResponse = try await getJSON(InfoResponse.self, path: "/v1/info")
-        
+        let _ : InfoResponse = try await getJSON(InfoResponse.self, base: mint, path: "/v1/info")
+
         do {
             let q: QuoteResponse = try await postJSON(QuoteResponse.self,
+                                                      base: mint,
                                                       path: "/v1/mint/quote/bolt11",
                                                       body: ["amount": amount, "unit": "sat"])
             return (q.invoice, q.expiresAt, q.quoteId)
         } catch {
-            print("RealMintAPI POST quote error:", error)
+            cocoLog("RealMintAPI POST quote error:", error)
             throw error
         }
     }
-    
+
     public func checkQuoteStatus(mint: MintURL, invoice: String) async throws -> QuoteStatus {
         // Common: GET /v1/mint/quote/bolt11/status?invoice=...
         do {
-            let s: StatusResponse = try await getJSON(StatusResponse.self, path: "/v1/mint/quote/bolt11/status", query: ["invoice": invoice])
+            let s: StatusResponse = try await getJSON(StatusResponse.self, base: mint, path: "/v1/mint/quote/bolt11/status", query: ["invoice": invoice])
             return s.paid ? .paid : .pending
         } catch {
-            print("RealMintAPI status check error:", error)
+            cocoLog("RealMintAPI status check error:", error)
             throw error
         }
     }
@@ -246,11 +248,11 @@ public struct RealMintAPI: MintAPI, Sendable {
     
     public func requestTokens(mint: MintURL, for invoice: String) async throws -> [Proof] {
         do {
-            let r: MintTokenResponse = try await postJSON(MintTokenResponse.self, path: "/v1/mint", body: ["invoice": invoice])
+            let r: MintTokenResponse = try await postJSON(MintTokenResponse.self, base: mint, path: "/v1/mint", body: ["invoice": invoice])
             return r.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hex: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") }
         } catch {
             do {
-                let r2: MintTokenResponse = try await postJSON(MintTokenResponse.self, path: "/v1/mint", body: ["payment_request": invoice])
+                let r2: MintTokenResponse = try await postJSON(MintTokenResponse.self, base: mint, path: "/v1/mint", body: ["payment_request": invoice])
                 return r2.proofs.map { Proof(amount: $0.amount, mint: mint, secret: Data(hex: $0.secret) ?? Data(), C: $0.C, keysetId: $0.id ?? "") }
             } catch {
                 throw error
@@ -299,19 +301,22 @@ public struct RealMintAPI: MintAPI, Sendable {
                 C_: signature.C_,
                 // FIX: Pass the ID from the mint response
                 // This ensures unblind() uses the correct keyset ID (00b4ec...)
-                id: signature.id
+                id: signature.id,
+                dleq: signature.dleq
             )
         }
     }
     
-    public func requestMeltQuote(mint: MintURL, amount: Int64, destination: String) async throws -> (quoteId: String, feeReserve: Int64) {
+    public func requestMeltQuote(mint: MintURL, amount: Int64, destination: String) async throws -> (quoteId: String, feeReserve: Int64, quotedAmount: Int64?) {
         let quoteBody: [String: Any] = ["request": destination, "unit": "sat"]
-        let q: MeltQuoteResponse = try await postJSON(MeltQuoteResponse.self, path: "/v1/melt/quote/bolt11", anyBody: quoteBody)
-        
+        let q: MeltQuoteResponse = try await postJSON(MeltQuoteResponse.self, base: mint, path: "/v1/melt/quote/bolt11", anyBody: quoteBody)
+
         guard let qid = q.quote ?? q.quoteId ?? q.id else {
             throw CashuError.protocolError("Melt quote missing ID")
         }
-        return (qid, q.feeReserve ?? 0)
+        // The mint decodes the invoice itself; its quoted amount is the authority,
+        // not the client-side regex parse of the invoice string.
+        return (qid, q.feeReserve ?? 0, q.amount)
     }
     
     public func executeMelt(mint: MintURL, quoteId: String, inputs: [Proof], outputs: [BlindedOutput]) async throws -> (preimage: String, change: [BlindSignatureDTO]?) {
@@ -334,10 +339,16 @@ public struct RealMintAPI: MintAPI, Sendable {
             "outputs": outputDTOs
         ]
         
-        let r: MeltResponse = try await postJSON(MeltResponse.self, path: "/v1/melt/bolt11", anyBody: payload)
+        let r: MeltResponse = try await postJSON(MeltResponse.self, base: mint, path: "/v1/melt/bolt11", anyBody: payload)
 
         guard r.paid else {
-            throw CashuError.protocolError("Melt not paid (state: \(r.state ?? "unknown"))")
+            // Distinguish "the payment definitely did not happen" (safe to release
+            // inputs) from "in flight / unknown" (inputs may be spent — must
+            // reconcile, never silently return to spendable).
+            if (r.state ?? "").uppercased() == "PENDING" {
+                throw CashuError.meltPending("Mint reports melt state PENDING")
+            }
+            throw CashuError.meltUnpaid
         }
         // When paid, the inputs are already spent at the mint. Don't fail the whole
         // operation just because a preimage wasn't included (some internal/MPP pays omit it).
@@ -346,63 +357,107 @@ public struct RealMintAPI: MintAPI, Sendable {
         // Map change output (Blind Signatures)
         let changeSigs: [BlindSignatureDTO]? = r.change?.map { mp in
             // For change, mint returns signatures C/C_, not full proofs with secrets
-            BlindSignatureDTO(amount: mp.amount, C_: mp.C_ ?? mp.C, C: mp.C_ ?? mp.C)
+            BlindSignatureDTO(amount: mp.amount, C_: mp.C_ ?? mp.C, C: mp.C_ ?? mp.C, id: mp.id, dleq: mp.dleq)
         }
-        
+
         return (pre, changeSigs)
+    }
+
+    /// NUT-05: poll a melt quote's settlement state. Used to resolve a PENDING
+    /// melt (Lightning payment in flight) into PAID/UNPAID without relying on an
+    /// app relaunch. Returns the current state and, when PAID, the signed change
+    /// (over the outputs originally submitted with the melt).
+    public func checkMeltQuote(mint: MintURL, quoteId: String) async throws -> (state: MeltState, change: [BlindSignatureDTO]?) {
+        let r: MeltResponse = try await getJSON(MeltResponse.self, base: mint, path: "/v1/melt/quote/bolt11/\(quoteId)")
+        let state: MeltState
+        switch (r.state ?? "").uppercased() {
+        case "PAID":    state = .paid
+        case "PENDING": state = .pending
+        case "UNPAID":  state = .unpaid
+        default:        state = r.paid ? .paid : .unknown   // legacy `paid: Bool` mints
+        }
+        let changeSigs: [BlindSignatureDTO]? = r.change?.map { mp in
+            BlindSignatureDTO(amount: mp.amount, C_: mp.C_ ?? mp.C, C: mp.C_ ?? mp.C, id: mp.id, dleq: mp.dleq)
+        }
+        return (state, changeSigs)
     }
     
     // MARK: - Networking helpers
-    
-    private func makeURL(path: String, query: [String: String]? = nil) -> URL {
-        var comps = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+
+    /// Transport policy: mints custody funds, so only HTTPS is acceptable —
+    /// except loopback addresses, so a local dev mint (http://localhost:3338)
+    /// still works. ATS enforces this on iOS, but this check also covers macOS
+    /// (no ATS in a plain SwiftPM context) and produces a clear error instead of
+    /// a silent connection failure.
+    public static func requireSecure(_ url: URL) throws {
+        let scheme = url.scheme?.lowercased()
+        if scheme == "https" { return }
+        let host = url.host?.lowercased() ?? ""
+        if scheme == "http", host == "localhost" || host == "127.0.0.1" || host == "::1" { return }
+        throw CashuError.network("Refusing insecure mint URL '\(url.absoluteString)' — mints must use https")
+    }
+
+    /// Build a request URL for `mint` (falling back to this instance's baseURL).
+    /// Every method that takes a `mint:` parameter MUST pass it through here —
+    /// ignoring it (the old behavior) sent cross-mint requests to the wrong
+    /// server, disclosing proofs and activity to an unrelated mint.
+    private func makeURL(base: URL? = nil, path: String, query: [String: String]? = nil) -> URL {
+        let root = base ?? baseURL
+        var comps = URLComponents(url: root.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         if let query { comps.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) } }
         return comps.url!
     }
-    
-    private func getJSON<T: Decodable>(_ type: T.Type, path: String, query: [String: String]? = nil) async throws -> T {
-        let url = makeURL(path: path, query: query)
+
+    private func getJSON<T: Decodable>(_ type: T.Type, base: URL? = nil, path: String, query: [String: String]? = nil) async throws -> T {
+        let url = makeURL(base: base, path: path, query: query)
+        try Self.requireSecure(url)
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        
+
         req.timeoutInterval = 120
-        
+
         let (data, resp) = try await session.data(for: req)
         try ensureOK(resp, url: url, data: data)
         return try decodeJSON(T.self, data: data)
     }
-    
-    private func postJSON<T: Decodable>(_ type: T.Type, path: String, body: [String: Any]) async throws -> T {
-        try await postJSON(type, path: path, anyBody: body)
+
+    private func postJSON<T: Decodable>(_ type: T.Type, base: URL? = nil, path: String, body: [String: Any]) async throws -> T {
+        try await postJSON(type, base: base, path: path, anyBody: body)
     }
-    
-    private func postJSON<T: Decodable>(_ type: T.Type, path: String, anyBody: [String: Any]) async throws -> T {
-        let url = makeURL(path: path)
+
+    private func postJSON<T: Decodable>(_ type: T.Type, base: URL? = nil, path: String, anyBody: [String: Any]) async throws -> T {
+        let url = makeURL(base: base, path: path)
+        try Self.requireSecure(url)
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        
+
         // FIX: Increase timeout to 120s for Lightning payments
         req.timeoutInterval = 120
-        
+
         req.httpBody = try JSONSerialization.data(withJSONObject: anyBody, options: [])
         let (data, resp) = try await session.data(for: req)
         try ensureOK(resp, url: url, data: data)
-        
+
         return try decodeJSON(T.self, data: data)
     }
     
     private func ensureOK(_ resp: URLResponse, url: URL, data: Data) throws {
+        // Error strings end up in UI alerts and logs, so identify the endpoint by
+        // host+path ONLY — the query string can carry a full BOLT11 invoice
+        // (checkQuoteStatus uses ?invoice=lnbc…), which would otherwise leak
+        // wallet activity into every surfaced error message.
+        let endpoint = "\(url.host ?? "?")\(url.path)"
         guard let http = resp as? HTTPURLResponse else {
-            throw CashuError.network("No HTTPURLResponse for \(url)")
+            throw CashuError.network("No HTTPURLResponse for \(endpoint)")
         }
         guard (200..<300).contains(http.statusCode) else {
             let msg = HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
             let body = String(data: data, encoding: .utf8) ?? "<binary>"
             let snippet = body.prefix(280)
-            throw CashuError.network("HTTP \(http.statusCode) (\(msg)) for \(url) — body: \(snippet)")
+            throw CashuError.network("HTTP \(http.statusCode) (\(msg)) for \(endpoint) — body: \(snippet)")
         }
     }
     
@@ -502,34 +557,62 @@ public struct RealMintAPI: MintAPI, Sendable {
         let keysets: [KeysetInfo]
     }
     
+    /// NUT-02: reject a keyset whose claimed version-00 ID does not match the ID
+    /// recomputed from its keys. A mismatch means the mint is serving keys that do
+    /// not belong to the advertised keyset — e.g. per-user keys for tagging.
+    /// Validation runs over the RAW key map exactly as served (see
+    /// `Keyset.deriveV00Id(rawKeys:)` — the parsed map drops the 2^63 denomination
+    /// that overflows Int64, which would wrongly reject honest 64-key mints).
+    private func validated(_ keyset: Keyset, rawKeys: [String: String]) throws -> Keyset {
+        guard Keyset.isValidV00Id(keyset.id, rawKeys: rawKeys) else {
+            throw CashuError.protocolError("Keyset ID '\(keyset.id)' does not match its keys (NUT-02) — refusing keyset from \(baseURL.host ?? baseURL.absoluteString)")
+        }
+        return keyset
+    }
+
     // Convert whatever the mint gives us into Keyset(amount:Int64 -> pubkeyHex)
     public func fetchKeyset() async throws -> Keyset {
         // First try to get fee info from /v1/keysets
         let feeInfo = try? await fetchKeysetFeeInfo()
-        
+
         let r: KeysResponse = try await getJSON(KeysResponse.self, path: "/v1/keys")
         if let ks = r.keysets?.first {
             let raw = ks.keys
             var map: [Int64:String] = [:]
             for (k,v) in raw { if let a = Int64(k) { map[a] = v } }
-            let keysetId = ks.id ?? baseURL.absoluteString
+            // If the mint omits the ID, derive it from the RAW keys per NUT-02 —
+            // never invent a non-keyset identifier (the old base-URL fallback
+            // collided every such keyset onto one NUT-13 derivation branch).
+            guard let keysetId = ks.id ?? Keyset.deriveV00Id(rawKeys: raw) else {
+                throw CashuError.protocolError("Mint keyset has no ID and one could not be derived from its keys")
+            }
             let fee = ks.input_fee_ppk ?? feeInfo?[keysetId] ?? 0
-            return Keyset(id: keysetId, keys: map, inputFeePPK: fee)
+            return try validated(Keyset(id: keysetId, keys: map, inputFeePPK: fee), rawKeys: raw)
         }
         if let raw = r.keys {
             var map: [Int64:String] = [:]
             for (k,v) in raw { if let a = Int64(k) { map[a] = v } }
+            guard let keysetId = Keyset.deriveV00Id(rawKeys: raw) else {
+                throw CashuError.protocolError("Could not derive keyset ID from mint keys")
+            }
             let fee = feeInfo?.values.first ?? 0
-            return Keyset(id: baseURL.absoluteString, keys: map, inputFeePPK: fee)
+            return Keyset(id: keysetId, keys: map, inputFeePPK: fee)
         }
         // Some mints expose { "1": "02ab...", "2": "03cd...", ... } at the top level
         if let obj = try? await getRaw(path: "/v1/keys"),
            let top = try? JSONSerialization.jsonObject(with: obj) as? [String:Any] {
+            var raw: [String:String] = [:]
             var map: [Int64:String] = [:]
-            for (k,v) in top { if let a = Int64(k), let s = v as? String { map[a] = s } }
+            for (k,v) in top {
+                if let s = v as? String { raw[k] = s }
+                if let a = Int64(k), let s = v as? String { map[a] = s }
+            }
             if !map.isEmpty {
+                guard let keysetId = Keyset.deriveV00Id(rawKeys: raw) else {
+                    throw CashuError.protocolError("Could not derive keyset ID from mint keys")
+                }
                 let fee = feeInfo?.values.first ?? 0
-                return Keyset(id: baseURL.absoluteString, keys: map, inputFeePPK: fee)
+                return Keyset(id: keysetId, keys: map, inputFeePPK: fee)
             }
         }
         throw CashuError.protocolError("Mint /v1/keys did not contain a usable keyset")
@@ -621,28 +704,29 @@ public struct RealMintAPI: MintAPI, Sendable {
                 let C_: String?
                 let C: String?
                 let id: String?
+                let dleq: DLEQProof?
             }
-            
+
             let signatures: [PrivateSignature]?
             let promises: [PrivateSignature]?
             var all: [PrivateSignature] { signatures ?? promises ?? [] }
         }
-        
-        let r: PrivateSwapResponse = try await postJSON(PrivateSwapResponse.self, path: "/v1/swap", anyBody: payload)
+
+        let r: PrivateSwapResponse = try await postJSON(PrivateSwapResponse.self, base: mint, path: "/v1/swap", anyBody: payload)
 
         if r.all.isEmpty {
             throw CashuError.protocolError("Swap returned no signatures")
         }
-        
-        // --- FIX IS HERE ---
-        // We must pass '$0.id' to the new struct so 'unblind' receives it.
+
+        // Pass id (so unblind uses the right keyset) and dleq (so unblind can verify
+        // the mint signed with its published key — NUT-12).
         return r.all.map { sig in
-            let blindSignatureDTO = BlindSignatureDTO(
+            BlindSignatureDTO(
                 amount: sig.amount,
                 C_: sig.C_ ?? sig.C,
-                id: sig.id
+                id: sig.id,
+                dleq: sig.dleq
             )
-            return blindSignatureDTO
         }
     }
     
@@ -666,51 +750,64 @@ public struct RealMintAPI: MintAPI, Sendable {
             struct BlindSig: Decodable {
                 let amount: Int64
                 let C_: String
+                let id: String?
+                let dleq: DLEQProof?
             }
             let signatures: [BlindSig]
         }
-        
+
         // 2. Request & Decode Internal Structure
         let response = try await postJSON(MintResponse.self, path: "/v1/mint/bolt11", anyBody: payload)
-        
+
         // 3. CRITICAL FIX: Convert Internal 'BlindSig' -> Public 'BlindSignatureDTO'
         return response.signatures.map { sig in
-            BlindSignatureDTO(amount: sig.amount, C_: sig.C_, C: nil)
+            BlindSignatureDTO(amount: sig.amount, C_: sig.C_, C: nil, id: sig.id, dleq: sig.dleq)
         }
     }
 
-    public func restore(mint: URL, outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO] {
+    public func restore(mint: URL, outputs: [BlindedOutput]) async throws -> (outputs: [BlindedOutput], promises: [BlindSignatureDTO]) {
         // Endpoint: POST /v1/restore
         let url = mint.appendingPathComponent("v1/restore")
+        try Self.requireSecure(url)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
+
         // Body: { "outputs": [ ... ] }
         let body: [String: Any] = [
             "outputs": outputs.map { ["amount": $0.amount, "B_": $0.B_, "id": $0.id] }
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
+
         let (data, response) = try await session.data(for: request)
-        
+
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let errorMsg = String(data: data, encoding: .utf8) ?? "Unknown"
-            print("⚠️ Restore Failed: \(errorMsg)")
+            cocoLog("⚠️ Restore Failed: \(errorMsg)")
             throw CashuError.network("Restore failed with status: \((response as? HTTPURLResponse)?.statusCode ?? 0)")
         }
-        
-        // Response: { "outputs": [], "promises": [ { "amount": 1, "C": "..." }, ... ] }
+
+        // Response: { "outputs": [ {amount,B_,id}, ... ], "promises"/"signatures": [ {amount,C_}, ... ] }
+        // `outputs[i]` and the i-th signature correspond; we echo B_ back so the
+        // caller can map each signature to the secret that produced it.
+        struct RestoreOutputDTO: Decodable { let amount: Int64?; let B_: String?; let id: String? }
         struct RestoreResponse: Decodable {
-            let promises: [BlindSignatureDTO]
+            let outputs: [RestoreOutputDTO]?
+            let promises: [BlindSignatureDTO]?
+            let signatures: [BlindSignatureDTO]?
         }
-        
+
         let decoded = try JSONDecoder().decode(RestoreResponse.self, from: data)
-        return decoded.promises
+        let promises = decoded.promises ?? decoded.signatures ?? []
+        let echoed: [BlindedOutput] = (decoded.outputs ?? []).map {
+            BlindedOutput(amount: $0.amount ?? 0, B_: $0.B_ ?? "", id: $0.id ?? "")
+        }
+        return (echoed, promises)
     }
     
     public func check(mint: URL, proofs: [ProofDTO]) async throws -> [CheckStateDTO] {
         let url = mint.appendingPathComponent("v1/check")
+        try Self.requireSecure(url)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -754,6 +851,7 @@ public struct RealMintAPI: MintAPI, Sendable {
         
         // We have to build the request manually here because getJSON uses self.baseURL
         let url = mint.appendingPathComponent(path)
+        try Self.requireSecure(url)
         var request = URLRequest(url: url)
         request.timeoutInterval = 10 // Fast timeout for checks
         
@@ -778,7 +876,8 @@ public struct RealMintAPI: MintAPI, Sendable {
         // Safe URL handling for the ID
         let path = "v1/keys/\(id)"
         let url = mint.appendingPathComponent(path)
-        
+        try Self.requireSecure(url)
+
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
         
@@ -808,8 +907,8 @@ public struct RealMintAPI: MintAPI, Sendable {
         for (k, v) in ks.keys {
             if let amt = Int64(k) { map[amt] = v }
         }
-        
-        return Keyset(id: ks.id, keys: map)
+
+        return try validated(Keyset(id: ks.id, keys: map), rawKeys: ks.keys)
     }
 }
 
@@ -818,6 +917,7 @@ private struct MintingResponse: Decodable {
         let amount: Int64
         let C_: String     // The blind signature
         let id: String?    // The keyset ID
+        let dleq: DLEQProof?   // NUT-12 proof (if the mint supports it)
     }
     let signatures: [BlindSignature]
 }

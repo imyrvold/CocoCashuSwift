@@ -5,6 +5,8 @@ public protocol ProofRepository: Sendable {
   func insert(_ proof: Proof) async throws
   func insertMany(_ proofs: [Proof]) async throws
   func fetchUnspent(mint: MintURL?) async throws -> [Proof]
+  func fetchPending(mint: MintURL?) async throws -> [Proof]
+  func fetchReserved(mint: MintURL?) async throws -> [Proof]
   func updateState(ids: [ProofId], to state: ProofState) async throws
   func reserve(ids: [ProofId], until: Date) async throws
   func delete(ids: [ProofId]) async throws
@@ -33,4 +35,10 @@ public protocol CounterRepository: Sendable {
   /// Atomically reserve `count` consecutive indices and return the first one,
   /// persisting the advance before returning.
   func reserve(key: String, count: Int) async throws -> Int64
+  /// Fast-forward the counter to at least `minimum` (a no-op if it is already
+  /// there or beyond — this can only move the counter FORWARD, never back).
+  /// Called after a seed restore so the next derivation lands past every index
+  /// the mint has already signed; without this, a restored wallet re-derives
+  /// index 0 and reuses secrets. Must persist before returning.
+  func advance(key: String, to minimum: Int64) async throws
 }

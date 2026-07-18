@@ -1,5 +1,6 @@
 import XCTest
 import CryptoKit
+import BIP39
 @testable import CocoCashuCore
 
 final class CocoCashuCoreTests: XCTestCase {
@@ -103,5 +104,224 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertEqual(hex(try ec_serialize_pubkey(&y0)), "024cce997d3b518f739663b757deaec95bcd9473c30a14ac2fd04023a739d1a725")
     XCTAssertEqual(hex(try ec_serialize_pubkey(&y1)), "022e7158e11c9506f1aa4248bf531298daa7febd6194f003edcd9b93ade6253acf")
     XCTAssertEqual(hex(try ec_serialize_pubkey(&y2)), "026cdbe15362df59cd1dd3c9c11de8aedac2106eca69236ecd9fbe117af897be4f")
+  }
+
+  // MARK: - NUT-12 DLEQ verification
+
+  /// Official NUT-12 "BlindSignature Verification" test vector. If this fails the
+  /// alice-side DLEQ math (R1 = s·G − e·A, R2 = s·B_ − e·C_, e == hash_e(...)) is
+  /// wrong, and every mint/swap would reject valid signatures once DLEQ is enforced.
+  func testDLEQVerifiesOfficialNUT12BlindSignatureVector() async throws {
+    let engine = makeEngine(counter: InMemoryCounterRepository())
+    let A  = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    let B_ = "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2"
+    let C_ = "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2"
+    let e  = "9818e061ee51d5c8edc3342369a554998ff7b4381c8652d724cdf46429be73d9"
+    let s  = "9818e061ee51d5c8edc3342369a554998ff7b4381c8652d724cdf46429be73da"
+
+    let ok = await engine.verifyDLEQ(blindedMessage: B_, blindSignature: C_, mintPubKey: A, e: e, s: s)
+    XCTAssertTrue(ok, "Official NUT-12 BlindSignature DLEQ vector must verify")
+
+    // A tampered `s` (here reusing the `e` value) must be rejected.
+    let bad = await engine.verifyDLEQ(blindedMessage: B_, blindSignature: C_, mintPubKey: A, e: e, s: e)
+    XCTAssertFalse(bad, "A DLEQ proof with the wrong s must be rejected")
+  }
+
+  // MARK: - NUT-13 official derivation vectors
+
+  private static let nut13Mnemonic = "half depart obvious quality work element tank gorilla view sugar picture humble"
+
+  private func makeVectorEngine(keysetID: String) throws -> CocoBlindingEngine {
+    let mnemonic = try BIP39.Mnemonic(phrase: Self.nut13Mnemonic.components(separatedBy: " "))
+    let seed = Data(mnemonic.seed)
+    let keyset = Keyset(id: keysetID, keys: [1: "02aa"])
+    return CocoBlindingEngine(seed: seed, counterRepo: InMemoryCounterRepository()) { _ in keyset }
+  }
+
+  /// Official NUT-13 test vectors, version 00 keyset (BIP32 derivation). If this
+  /// fails, seed phrases are not portable: funds minted here can't be restored in
+  /// any other Cashu wallet and vice versa.
+  func testNUT13Version00DerivationMatchesOfficialVectors() async throws {
+    let keysetID = "009a1f293253e41e"
+    let engine = try makeVectorEngine(keysetID: keysetID)
+    let mint = URL(string: "https://mint.test")!
+
+    let expectedSecrets = [
+      "485875df74771877439ac06339e284c3acfcd9be7abf3bc20b516faeadfe77ae",
+      "8f2b39e8e594a4056eb1e6dbb4b0c38ef13b1b2c751f64f810ec04ee35b77270",
+      "bc628c79accd2364fd31511216a0fab62afd4a18ff77a20deded7b858c9860c8",
+      "59284fd1650ea9fa17db2b3acf59ecd0f2d52ec3261dd4152785813ff27a33bf",
+      "576c23393a8b31cc8da6688d9c9a96394ec74b40fdaf1f693a6bb84284334ea0",
+    ]
+    let expectedRs = [
+      "ad00d431add9c673e843d4c2bf9a778a5f402b985b8da2d5550bf39cda41d679",
+      "967d5232515e10b81ff226ecf5a9e2e2aff92d66ebc3edf0987eb56357fd6248",
+      "b20f47bb6ae083659f3aa986bfa0435c55c6d93f687d51a01f26862d9b9a4899",
+      "fb5fca398eb0b1deb955a2988b5ac77d32956155f1c002a373535211a2dfdc29",
+      "5f09bfbfe27c439a597719321e061e2e40aad4a36768bb2bcc3de547c9644bf9",
+    ]
+
+    let (_, secrets) = try await engine.deriveForRestore(
+      indices: [0, 1, 2, 3, 4], mint: mint, keysetID: keysetID
+    )
+    for i in 0..<5 {
+      let (secret, r) = try XCTUnwrap(secrets[UInt32(i)])
+      XCTAssertEqual(String(data: secret, encoding: .utf8), expectedSecrets[i], "secret at counter \(i)")
+      XCTAssertEqual(hex(r), expectedRs[i], "r at counter \(i)")
+    }
+  }
+
+  /// Official NUT-13 test vectors, version 01 keyset (HMAC-SHA256 KDF).
+  func testNUT13Version01DerivationMatchesOfficialVectors() async throws {
+    let keysetID = "015ba18a8adcd02e715a58358eb618da4a4b3791151a4bee5e968bb88406ccf76a"
+    let engine = try makeVectorEngine(keysetID: keysetID)
+    let mint = URL(string: "https://mint.test")!
+
+    let expectedSecrets = [
+      "db5561a07a6e6490f8dadeef5be4e92f7cebaecf2f245356b5b2a4ec40687298",
+      "b70e7b10683da3bf1cdf0411206f8180c463faa16014663f39f2529b2fda922e",
+      "78a7ac32ccecc6b83311c6081b89d84bb4128f5a0d0c5e1af081f301c7a513f5",
+      "094a2b6c63bfa7970bc09cda0e1cfc9cd3d7c619b8e98fabcfc60aea9e4963e5",
+      "5e89fc5d30d0bf307ddf0a3ac34aa7a8ee3702169dafa3d3fe1d0cae70ecd5ef",
+    ]
+    let expectedRs = [
+      "6d26181a3695e32e9f88b80f039ba1ae2ab5a200ad4ce9dbc72c6d3769f2b035",
+      "bde4354cee75545bea1a2eee035a34f2d524cee2bb01613823636e998386952e",
+      "f40cc1218f085b395c8e1e5aaa25dccc851be3c6c7526a0f4e57108f12d6dac4",
+      "099ed70fc2f7ac769bc20b2a75cb662e80779827b7cc358981318643030577d0",
+      "5550337312d223ba62e3f75cfe2ab70477b046d98e3e71804eade3956c7b98cf",
+    ]
+
+    let (_, secrets) = try await engine.deriveForRestore(
+      indices: [0, 1, 2, 3, 4], mint: mint, keysetID: keysetID
+    )
+    for i in 0..<5 {
+      let (secret, r) = try XCTUnwrap(secrets[UInt32(i)])
+      XCTAssertEqual(String(data: secret, encoding: .utf8), expectedSecrets[i], "secret at counter \(i)")
+      XCTAssertEqual(hex(r), expectedRs[i], "r at counter \(i)")
+    }
+  }
+
+  // MARK: - NUT-02 keyset ID integrity
+
+  /// A keyset whose claimed v00 ID doesn't match its keys must be rejected;
+  /// the derived ID must be stable and correctly formatted.
+  func testKeysetV00IdDerivationAndValidation() throws {
+    // Two deterministic (valid-format) compressed pubkeys.
+    let rawKeys: [String: String] = [
+      "1": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "2": "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+    ]
+    let derived = try XCTUnwrap(Keyset.deriveV00Id(rawKeys: rawKeys))
+    XCTAssertTrue(derived.hasPrefix("00"))
+    XCTAssertEqual(derived.count, 16)
+
+    // Self-consistent keyset validates; a lying ID of valid v00 shape does not.
+    XCTAssertTrue(Keyset.isValidV00Id(derived, rawKeys: rawKeys))
+    XCTAssertFalse(Keyset.isValidV00Id("00deadbeefdead00", rawKeys: rawKeys))
+    // Non-v00 ids are (for now) not checkable and must not be rejected.
+    XCTAssertTrue(Keyset.isValidV00Id("015ba18a8adcd02e715a58358eb618da4a4b3791151a4bee5e968bb88406ccf76a", rawKeys: rawKeys))
+  }
+
+  /// Regression: mints publish 64 denominations up to 2^63 (9223372036854775808),
+  /// which does NOT fit in Int64. Deriving the ID from the Int64-parsed map
+  /// silently dropped that key and mis-derived the ID, wrongly rejecting every
+  /// honest 64-key mint (hit in the field against mint.minibits.cash). The raw
+  /// derivation must include it. (Expected value independently computed with
+  /// python hashlib over the same keys.)
+  func testKeysetV00IdIncludesAmountsBeyondInt64() throws {
+    let rawKeys: [String: String] = [
+      "1": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "9223372036854775808": "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+    ]
+    XCTAssertEqual(Keyset.deriveV00Id(rawKeys: rawKeys), "00e7ce2799825ee6")
+    XCTAssertTrue(Keyset.isValidV00Id("00e7ce2799825ee6", rawKeys: rawKeys))
+  }
+
+  // MARK: - NUT-00 V4 (cashuB) token deserialization
+
+  /// Official NUT-00 V4 single-keyset test vector. Failing this means the wallet
+  /// can't receive tokens from modern wallets (Minibits/cashu.me send cashuB).
+  func testTokenV4DeserializesOfficialSingleKeysetVector() throws {
+    let token = "cashuBpGF0gaJhaUgArSaMTR9YJmFwgaNhYQFhc3hAOWE2ZGJiODQ3YmQyMzJiYTc2ZGIwZGYxOTcyMTZiMjlkM2I4Y2MxNDU1M2NkMjc4MjdmYzFjYzk0MmZlZGI0ZWFjWCEDhhhUP_trhpXfStS6vN6So0qWvc2X3O4NfM-Y1HISZ5JhZGlUaGFuayB5b3VhbXVodHRwOi8vbG9jYWxob3N0OjMzMzhhdWNzYXQ="
+
+    let decoded = try TokenV4Helper.deserialize(token)
+    XCTAssertEqual(decoded.mint, "http://localhost:3338")
+    XCTAssertEqual(decoded.unit, "sat")
+    XCTAssertEqual(decoded.memo, "Thank you")
+    XCTAssertEqual(decoded.proofs.count, 1)
+
+    let p = try XCTUnwrap(decoded.proofs.first)
+    XCTAssertEqual(p.keysetId, "00ad268c4d1f5826")
+    XCTAssertEqual(p.amount, 1)
+    XCTAssertEqual(p.secret, "9a6dbb847bd232ba76db0df197216b29d3b8cc14553cd27827fc1cc942fedb4e")
+    XCTAssertEqual(p.C, "038618543ffb6b8695df4ad4babcde92a34a96bdcd97dcee0d7ccf98d472126792")
+  }
+
+  /// Official NUT-00 V4 multi-keyset test vector (2 keysets, 3 proofs).
+  func testTokenV4DeserializesOfficialMultiKeysetVector() throws {
+    let token = "cashuBo2F0gqJhaUgA_9SLj17PgGFwgaNhYQFhc3hAYWNjMTI0MzVlN2I4NDg0YzNjZjE4NTAxNDkyMThhZjkwZjcxNmE1MmJmNGE1ZWQzNDdlNDhlY2MxM2Y3NzM4OGFjWCECRFODGd5IXVW-07KaZCvuWHk3WrnnpiDhHki6SCQh88-iYWlIAK0mjE0fWCZhcIKjYWECYXN4QDEzMjNkM2Q0NzA3YTU4YWQyZTIzYWRhNGU5ZjFmNDlmNWE1YjRhYzdiNzA4ZWIwZDYxZjczOGY0ODMwN2U4ZWVhY1ghAjRWqhENhLSsdHrr2Cw7AFrKUL9Ffr1XN6RBT6w659lNo2FhAWFzeEA1NmJjYmNiYjdjYzY0MDZiM2ZhNWQ1N2QyMTc0ZjRlZmY4YjQ0MDJiMTc2OTI2ZDNhNTdkM2MzZGNiYjU5ZDU3YWNYIQJzEpxXGeWZN5qXSmJjY8MzxWyvwObQGr5G1YCCgHicY2FtdWh0dHA6Ly9sb2NhbGhvc3Q6MzMzOGF1Y3NhdA"
+
+    let decoded = try TokenV4Helper.deserialize(token)
+    XCTAssertEqual(decoded.mint, "http://localhost:3338")
+    XCTAssertEqual(decoded.unit, "sat")
+    XCTAssertNil(decoded.memo)
+    XCTAssertEqual(decoded.proofs.count, 3)
+
+    XCTAssertEqual(decoded.proofs[0].keysetId, "00ffd48b8f5ecf80")
+    XCTAssertEqual(decoded.proofs[0].amount, 1)
+    XCTAssertEqual(decoded.proofs[0].secret, "acc12435e7b8484c3cf1850149218af90f716a52bf4a5ed347e48ecc13f77388")
+    XCTAssertEqual(decoded.proofs[0].C, "0244538319de485d55bed3b29a642bee5879375ab9e7a620e11e48ba482421f3cf")
+
+    XCTAssertEqual(decoded.proofs[1].keysetId, "00ad268c4d1f5826")
+    XCTAssertEqual(decoded.proofs[1].amount, 2)
+    XCTAssertEqual(decoded.proofs[1].secret, "1323d3d4707a58ad2e23ada4e9f1f49f5a5b4ac7b708eb0d61f738f48307e8ee")
+    XCTAssertEqual(decoded.proofs[1].C, "023456aa110d84b4ac747aebd82c3b005aca50bf457ebd5737a4414fac3ae7d94d")
+
+    XCTAssertEqual(decoded.proofs[2].keysetId, "00ad268c4d1f5826")
+    XCTAssertEqual(decoded.proofs[2].amount, 1)
+    XCTAssertEqual(decoded.proofs[2].secret, "56bcbcbb7cc6406b3fa5d57d2174f4eff8b4402b176926d3a57d3c3dcbb59d57")
+    XCTAssertEqual(decoded.proofs[2].C, "0273129c5719e599379a974a626363c333c56cafc0e6d01abe46d5808280789c63")
+  }
+
+  /// Malformed cashuB input must throw, not crash: truncated CBOR, garbage
+  /// base64, wrong shape, and (importantly) a V3 JSON payload behind a cashuB prefix.
+  func testTokenV4RejectsMalformedInput() {
+    let bad = [
+      "cashuB",                                       // empty payload
+      "cashuB!!!!",                                   // invalid base64
+      "cashuBAAAA",                                   // valid base64, garbage CBOR
+      "cashuBpGF0gaJhaUgArSaMTR9YJmFwga",             // truncated vector
+      "cashuBeyJ0b2tlbiI6W119",                       // JSON payload with B prefix
+    ]
+    for token in bad {
+      XCTAssertThrowsError(try TokenV4Helper.deserialize(token), "must reject: \(token)")
+    }
+  }
+
+  /// Restore must skip keysets NUT-13 can't derive on (legacy base64 IDs that
+  /// mints still list, e.g. 'ctv28hTYzQwr' on mint.minibits.cash) instead of
+  /// failing the whole mint scan on them — and must scan the supported formats.
+  func testRestoreKeysetSupportGate() {
+    XCTAssertTrue(WalletRestorationService.supportsNUT13Derivation(keysetId: "009a1f293253e41e"))
+    XCTAssertTrue(WalletRestorationService.supportsNUT13Derivation(keysetId: "00107937db0cc865"))
+    XCTAssertTrue(WalletRestorationService.supportsNUT13Derivation(keysetId: "015ba18a8adcd02e715a58358eb618da4a4b3791151a4bee5e968bb88406ccf76a"))
+    XCTAssertFalse(WalletRestorationService.supportsNUT13Derivation(keysetId: "ctv28hTYzQwr"))     // legacy base64
+    XCTAssertFalse(WalletRestorationService.supportsNUT13Derivation(keysetId: "0z12"))             // not hex
+    XCTAssertFalse(WalletRestorationService.supportsNUT13Derivation(keysetId: "02deadbeef"))       // wrong version/length
+    XCTAssertFalse(WalletRestorationService.supportsNUT13Derivation(keysetId: "https://mint.test"))
+  }
+
+  /// H6: unparseable keyset IDs must throw, never silently derive from branch 0.
+  func testDerivationThrowsOnUnsupportedKeysetIDs() async throws {
+    let engine = makeEngine(counter: InMemoryCounterRepository())
+    let mint = URL(string: "https://mint.test")!
+
+    for badId in ["https://mint.test", "notHex==", "0z12", "02deadbeef"] {
+      do {
+        _ = try await engine.deriveForRestore(indices: [0], mint: mint, keysetID: badId)
+        XCTFail("Keyset ID '\(badId)' must be rejected, not silently mapped to branch 0")
+      } catch { /* expected */ }
+    }
   }
 }

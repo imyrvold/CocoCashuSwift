@@ -31,11 +31,11 @@ public actor InMemoryProofRepository: ProofRepository {
                 
                 // 2. Revive if newly found as unspent
                 if updated.state != .unspent && p.state == .unspent {
-                    print("✨ Reviving spent token: \(p.amount) sats")
+                    cocoLog("✨ Reviving spent token: \(p.amount) sats")
                     updated.state = .unspent
                 } else {
                     // It's already fine, just updated metadata
-                    print("🔄 Synced duplicate token: \(p.amount) sats")
+                    cocoLog("🔄 Synced duplicate token: \(p.amount) sats")
                 }
                 
                 store[p.C] = updated
@@ -43,12 +43,13 @@ public actor InMemoryProofRepository: ProofRepository {
             } else {
                 // NEW TOKEN
                 store[p.C] = p
-                print("✅ Added new token: \(p.amount) sats")
+                cocoLog("✅ Added new token: \(p.amount) sats")
             }
         }
     }
     
     public func fetchUnspent(mint: MintURL?) async throws -> [Proof] {
+        releaseExpiredReservations()
         if let m = mint {
             return store.values.filter {
                 $0.state == .unspent && areSameMint($0.mint, m)
@@ -56,7 +57,41 @@ public actor InMemoryProofRepository: ProofRepository {
         }
         return store.values.filter { $0.state == .unspent }
     }
-    
+
+    /// Enforce the reservation timeout: a proof whose `reservedUntil` has passed
+    /// was reserved by an operation that died without cleaning up — release it so
+    /// funds don't stay stranded forever. (`.pending` proofs are NOT touched; they
+    /// were knowingly submitted to the mint and only NUT-07 may release them.)
+    private func releaseExpiredReservations() {
+        let now = Date()
+        for (key, proof) in store where proof.state == .reserved {
+            if let until = proof.reservedUntil, until < now {
+                var p = proof
+                p.state = .unspent
+                p.reservedUntil = nil
+                store[key] = p
+            }
+        }
+    }
+
+    public func fetchPending(mint: MintURL?) async throws -> [Proof] {
+        if let m = mint {
+            return store.values.filter {
+                $0.state == .pending && areSameMint($0.mint, m)
+            }
+        }
+        return store.values.filter { $0.state == .pending }
+    }
+
+    public func fetchReserved(mint: MintURL?) async throws -> [Proof] {
+        if let m = mint {
+            return store.values.filter {
+                $0.state == .reserved && areSameMint($0.mint, m)
+            }
+        }
+        return store.values.filter { $0.state == .reserved }
+    }
+
     public func updateState(ids: [ProofId], to state: ProofState) async throws {
         // Since we changed the key to C, we need to iterate to find by ID
         // (Performance note: In a real DB, you'd index ID too. For memory, this is fine.)
@@ -108,6 +143,10 @@ public actor InMemoryQuoteRepository: QuoteRepository {
   }
 }
 
+/// In-memory NUT-13 counter — **for tests only**. It resets to 0 every launch, so
+/// using it in production GUARANTEES derivation-index reuse (same secret + blinding
+/// factor derived twice → the mint rejects the duplicate, or funds become
+/// ambiguous). Production code must use `FileCounterRepository`.
 public actor InMemoryCounterRepository: CounterRepository {
   private var counters: [String: Int64] = [:]
   public init() {}
@@ -116,6 +155,9 @@ public actor InMemoryCounterRepository: CounterRepository {
     let start = counters[key] ?? 0
     counters[key] = start + Int64(count)
     return start
+  }
+  public func advance(key: String, to minimum: Int64) async throws {
+    counters[key] = max(counters[key] ?? 0, minimum)
   }
 }
 
@@ -144,8 +186,19 @@ public actor FileCounterRepository: CounterRepository {
     return start
   }
 
+  public func advance(key: String, to minimum: Int64) async throws {
+    let current = counters[key] ?? 0
+    guard minimum > current else { return }
+    counters[key] = minimum
+    try persist()
+  }
+
   private func persist() throws {
     let data = try JSONEncoder().encode(counters)
-    try data.write(to: url, options: .atomic)
+    var options: Data.WritingOptions = [.atomic]
+    #if os(iOS)
+    options.insert(.completeFileProtection)
+    #endif
+    try data.write(to: url, options: options)
   }
 }

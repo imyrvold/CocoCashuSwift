@@ -25,7 +25,14 @@ let package = Package(
       ]
     ),
     .target(name: "CocoCashuUI", dependencies: ["CocoCashuCore"]),
-    .testTarget(name: "CocoCashuCoreTests", dependencies: ["CocoCashuCore"]),
+    .testTarget(
+      name: "CocoCashuCoreTests",
+      dependencies: [
+        "CocoCashuCore",
+        // Needed to turn the official NUT-13 test-vector mnemonic into a seed.
+        .product(name: "BIP39", package: "BIP39")
+      ]
+    ),
   ]
 )
 

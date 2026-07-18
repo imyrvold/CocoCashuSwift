@@ -40,7 +40,13 @@ public actor HistoryService {
 
     private func save() {
         if let data = try? JSONEncoder().encode(transactions) {
-            try? data.write(to: fileURL)
+            // Atomic + complete file protection, matching proofs.json: history
+            // reveals amounts/timestamps, and a torn write corrupts the file.
+            var options: Data.WritingOptions = [.atomic]
+            #if os(iOS)
+            options.insert(.completeFileProtection)
+            #endif
+            try? data.write(to: fileURL, options: options)
         }
     }
     

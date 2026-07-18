@@ -14,7 +14,10 @@ public actor ProofService {
   }
 
   /// Reserve proofs for spending. Caller should cancel/update on failure.
-  public func reserve(amount: Int64, mint: MintURL, timeout: TimeInterval = 60) async throws -> [Proof] {
+  /// The timeout must exceed the longest possible network operation (melt requests
+  /// run up to 120s) with margin — an in-flight operation whose reservation expires
+  /// would have its inputs released and double-spendable by a concurrent operation.
+  public func reserve(amount: Int64, mint: MintURL, timeout: TimeInterval = 300) async throws -> [Proof] {
     var total: Int64 = 0
     let unspent = try await proofs.fetchUnspent(mint: mint).sorted { $0.amount > $1.amount }
     var toUse: [Proof] = []
@@ -31,6 +34,25 @@ public actor ProofService {
   public func markSpent(_ ids: [ProofId], mint: MintURL) async throws {
     try await proofs.updateState(ids: ids, to: .spent)
     events.emit(.proofsUpdated(mint: mint))
+  }
+
+  /// Park proofs whose melt outcome is unknown. They stop counting toward the
+  /// spendable balance until `reconcilePending` resolves them via NUT-07.
+  public func markPending(_ ids: [ProofId], mint: MintURL) async throws {
+    try await proofs.updateState(ids: ids, to: .pending)
+    events.emit(.proofsUpdated(mint: mint))
+  }
+
+  /// Proofs currently parked as `.pending` (awaiting NUT-07 reconciliation).
+  public func pendingProofs(mint: MintURL? = nil) async throws -> [Proof] {
+    try await proofs.fetchPending(mint: mint)
+  }
+
+  /// Proofs currently `.reserved` by an in-flight operation. Exposed so the
+  /// persistence layer can save them — an app kill mid-operation must not erase
+  /// them from disk (they are still money until the mint says otherwise).
+  public func reservedProofs(mint: MintURL? = nil) async throws -> [Proof] {
+    try await proofs.fetchReserved(mint: mint)
   }
 
   public func addNew(_ proofsToAdd: [Proof]) async throws {

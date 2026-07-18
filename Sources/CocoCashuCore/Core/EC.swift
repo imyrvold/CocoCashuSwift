@@ -46,33 +46,42 @@ func ec_serialize_pubkey(_ pk: inout secp256k1_pubkey) throws -> Data {
   }
 }
 
+// Serialize pubkey (uncompressed, 65 bytes with 0x04 prefix).
+// NUT-12's hash_e concatenates the UNCOMPRESSED hex of each point, so DLEQ
+// verification must use this encoding — not the compressed one above.
+func ec_serialize_pubkey_uncompressed(_ pk: inout secp256k1_pubkey) throws -> Data {
+  return try withContext { ctx in
+    var out = [UInt8](repeating: 0, count: 65)
+    var outlen: Int = 65
+    guard secp256k1_ec_pubkey_serialize(ctx, &out, &outlen, &pk, UInt32(SECP256K1_EC_UNCOMPRESSED)) == 1 else {
+      throw ECError.serializePubKey
+    }
+    return Data(out[0..<outlen])
+  }
+}
+
 // Create pubkey from a 32-byte scalar: pk = s*G
+// The scalar MUST be a valid secp256k1 secret key. Callers pass NUT-13-derived
+// blinding factors, which are already reduced into range — so an invalid scalar
+// here signals a real bug, and we throw rather than silently substituting
+// sha256(scalar) (which would mask the bug and desync from the mint's math).
 func ec_pubkey_from_scalar(_ scalar32: Data) throws -> secp256k1_pubkey {
   return try withContext { ctx in
     var sk = [UInt8](scalar32)
     var pk = secp256k1_pubkey()
-    // lib expects valid scalar (in [1,n-1]); reduce by hashing if needed
-    if secp256k1_ec_seckey_verify(ctx, &sk) != 1 {
-      var h = [UInt8](sha256(scalar32))
-      guard secp256k1_ec_seckey_verify(ctx, &h) == 1 else { throw ECError.invalidScalar }
-      sk = h
-    }
+    guard secp256k1_ec_seckey_verify(ctx, &sk) == 1 else { throw ECError.invalidScalar }
     guard secp256k1_ec_pubkey_create(ctx, &pk, &sk) == 1 else { throw ECError.invalidScalar }
     return pk
   }
 }
 
-// Compute r*P
+// Compute r*P. As above, `scalar32` must be a valid scalar; throw on invalid
+// input instead of substituting a hash.
 func ec_tweak_mul_pubkey(_ P: inout secp256k1_pubkey, _ scalar32: Data) throws -> secp256k1_pubkey {
   return try withContext { ctx in
     var pk = P // copy
     var tweak = [UInt8](scalar32)
-    // reduce tweak if needed
-    if secp256k1_ec_seckey_verify(ctx, &tweak) != 1 {
-      var h = [UInt8](sha256(scalar32))
-      guard secp256k1_ec_seckey_verify(ctx, &h) == 1 else { throw ECError.invalidScalar }
-      tweak = h
-    }
+    guard secp256k1_ec_seckey_verify(ctx, &tweak) == 1 else { throw ECError.invalidScalar }
     guard secp256k1_ec_pubkey_tweak_mul(ctx, &pk, &tweak) == 1 else { throw ECError.invalidScalar }
     return pk
   }
@@ -96,6 +105,30 @@ func ec_combine(_ A: inout secp256k1_pubkey, _ B: inout secp256k1_pubkey) throws
       }
     }
   }
+}
+
+// Scalar addition mod n: (key + tweak) mod n, as required by BIP32 CKDpriv.
+// Throws when the tweak is out of range or the result is 0 — per BIP32 those
+// (astronomically unlikely) cases must be handled by the caller, never masked.
+func ec_seckey_tweak_add(_ key32: Data, _ tweak32: Data) throws -> Data {
+  return try withContext { ctx in
+    var sk = [UInt8](key32)
+    var tweak = [UInt8](tweak32)
+    guard sk.count == 32, tweak.count == 32 else { throw ECError.invalidScalar }
+    guard secp256k1_ec_seckey_tweak_add(ctx, &sk, &tweak) == 1 else {
+      throw ECError.invalidScalar
+    }
+    return Data(sk)
+  }
+}
+
+// Validity check for a 32-byte scalar as a secp256k1 private key (in [1, n-1]).
+func ec_seckey_verify(_ key32: Data) -> Bool {
+  guard key32.count == 32 else { return false }
+  return (try? withContext { ctx in
+    var sk = [UInt8](key32)
+    return secp256k1_ec_seckey_verify(ctx, &sk) == 1
+  }) ?? false
 }
 
 // Negate: -P

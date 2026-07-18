@@ -7,85 +7,112 @@ public actor WalletRestorationService {
     public init(manager: CashuManager) {
         self.manager = manager
     }
-    
+
+    /// NUT-13 derivation is defined only for hex keyset IDs: version 00 (8-byte)
+    /// and version 01 (33-byte). Mints still LIST legacy base64 keysets (e.g.
+    /// 'ctv28hTYzQwr' on mint.minibits.cash) alongside current ones — this wallet
+    /// can never have derived secrets under those, so the scan must SKIP them
+    /// rather than fail the whole mint on the engine's (correct) refusal to derive.
+    static func supportsNUT13Derivation(keysetId: String) -> Bool {
+        guard let bytes = Data(hex: keysetId) else { return false }
+        let lower = keysetId.lowercased()
+        return (bytes.count == 8 && lower.hasPrefix("00"))
+            || (bytes.count == 33 && lower.hasPrefix("01"))
+    }
+
     public func restoreFunds(mintURL: URL, progress: (@Sendable (Int64) -> Void)? = nil) async throws -> Int {
-        // Standard powers of 2
-        let amounts: [Int64] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
         var totalRestored = 0
         
-        print("🕵️ RESTORE: Starting scan for \(mintURL.absoluteString)")
+        cocoLog("🕵️ RESTORE: Starting scan for \(mintURL.absoluteString)")
         
         // 1. Fetch ALL Keyset IDs (Deterministic!)
         let keysetIds = try await manager.mintService.api.fetchKeysetIds(mint: mintURL)
-        print("🕵️ RESTORE: Found \(keysetIds.count) active keysets: \(keysetIds)")
+        cocoLog("🕵️ RESTORE: Found \(keysetIds.count) active keysets: \(keysetIds)")
         
-        // 2. Loop through EACH keyset
+        // 2. Loop through EACH keyset. Failures are isolated per keyset: one
+        // unsupported or unreachable keyset must not abort the scan of the rest.
         for kId in keysetIds {
-            print("🔑 RESTORE: Scanning Keyset ID: \(kId)")
-            
-            // Fetch keys for this specific ID so we can verify later if needed
-            guard let keyset = try? await manager.mintService.api.fetchKeyset(mint: mintURL, id: kId) else {
-                print("⚠️ RESTORE: Skipping Keyset \(kId) (Could not fetch keys)")
+            cocoLog("🔑 RESTORE: Scanning Keyset ID: \(kId)")
+
+            guard Self.supportsNUT13Derivation(keysetId: kId) else {
+                cocoLog("⚠️ RESTORE: Skipping keyset \(kId) — legacy/unsupported ID format, no NUT-13 derivation exists for it")
                 continue
             }
-            
+
+            // Fetch keys for this specific ID so we can verify later if needed
+            guard let keyset = try? await manager.mintService.api.fetchKeyset(mint: mintURL, id: kId) else {
+                cocoLog("⚠️ RESTORE: Skipping Keyset \(kId) (Could not fetch keys)")
+                continue
+            }
+
             var currentIndex: UInt32 = 0
             var emptyBatches = 0
-            
+            // Highest derivation index the mint returned a signature for, including
+            // indices whose proofs are already SPENT — the counter must move past
+            // all of them or the next blind() re-derives an already-signed secret.
+            var maxSignedIndex: Int64 = -1
+
+            do {
             while emptyBatches < 3 {
                 if currentIndex > 100 { break } // Safety limit
                 
-                print("   Scanning indices \(currentIndex)-\(currentIndex+20)...")
+                cocoLog("   Scanning indices \(currentIndex)-\(currentIndex+20)...")
                 
                 let indices = (0..<20).map { currentIndex + UInt32($0) }
                 let (blindedData, secretMap) = try await manager.blinding.deriveForRestore(indices: indices, mint: mintURL, keysetID: kId)
-                
-                // Construct Payload
-                var restorePayload: [BlindedOutput] = []
-                for bOut in blindedData {
-                    for amt in amounts {
-                        restorePayload.append(BlindedOutput(amount: amt, B_: bOut.B_, id: kId))
+
+                // Map each derived blinded message B_ back to its (secret, r). B_ is
+                // amount-independent, so we send each B_ exactly once with a neutral
+                // placeholder amount — the mint matches on B_ and echoes the real
+                // signed amount in its promise. (The old code sent each B_ times every
+                // denomination, which scrambled the correspondence.)
+                var secretByB: [String: (secret: Data, r: Data)] = [:]
+                var indexByB: [String: UInt32] = [:]
+                for (offset, bOut) in blindedData.enumerated() where offset < indices.count {
+                    if let sr = secretMap[indices[offset]] {
+                        secretByB[bOut.B_] = sr
+                        indexByB[bOut.B_] = indices[offset]
                     }
                 }
-                
+                let restorePayload = blindedData.map { BlindedOutput(amount: 1, B_: $0.B_, id: kId) }
+
                 // Network Request
-                let signatures = try await manager.mintService.api.restore(mint: mintURL, outputs: restorePayload)
-                
+                let (echoedOutputs, signatures) = try await manager.mintService.api.restore(mint: mintURL, outputs: restorePayload)
+
                 if signatures.isEmpty {
                     emptyBatches += 1
                     currentIndex += 20
                     continue
                 }
-                
-                // 5. Match Signatures back to Secrets
+
+                if echoedOutputs.count != signatures.count {
+                    cocoLog("⚠️ RESTORE: mint returned \(signatures.count) promises but \(echoedOutputs.count) echoed outputs; pairing the aligned prefix only.")
+                }
+
+                // 5. Pair each promise to the EXACT secret/r that produced its B_.
+                // NUT-09 returns echoedOutputs[i] alongside signatures[i], so the B_ at
+                // position i tells us which secret to unblind with. This replaces the old
+                // "try every secret, accept the first that unblinds" loop, which always
+                // matched secret index 0 (attemptUnblind succeeds for any well-formed
+                // pair) and produced duplicate, unspendable proofs.
                 var proofs: [Proof] = []
-                
-                // CRITICAL FIX: Sort secrets by index to ensure deterministic matching.
-                // This stops the "Doubling" bug by ensuring we always pick the same index
-                // for the same signature every time we scan.
-                let sortedSecrets = secretMap.sorted { $0.key < $1.key }
-                
-                for sig in signatures {
-                    guard let Chex = sig.C_ ?? sig.C else { continue }
-                    
-                    for (_, (secret, r)) in sortedSecrets {
-                        // 1. Unblind
-                        if let proof = try? await attemptUnblind(
-                            sig: sig,
-                            amount: sig.amount,
-                            r: r,
-                            secret: secret,
-                            mintPub: keyset.keys[sig.amount] ?? "",
-                            keysetId: keyset.id,
-                            mintURL: mintURL
-                        ) {
-                            // 2. Accept the first valid match
-                            // Since we are sorted, this will always be the lowest available index
-                            // for this signature, ensuring stability.
-                            proofs.append(proof)
-                            break // Stop looking for this signature
-                        }
-                        
+                for (i, sig) in signatures.enumerated() {
+                    guard i < echoedOutputs.count else { break }
+                    guard let (secret, r) = secretByB[echoedOutputs[i].B_] else { continue }
+                    if let idx = indexByB[echoedOutputs[i].B_] {
+                        maxSignedIndex = max(maxSignedIndex, Int64(idx))
+                    }
+                    guard let mintPub = keyset.keys[sig.amount] else { continue }
+                    if let proof = try? await attemptUnblind(
+                        sig: sig,
+                        amount: sig.amount,
+                        r: r,
+                        secret: secret,
+                        mintPub: mintPub,
+                        keysetId: keyset.id,
+                        mintURL: mintURL
+                    ) {
+                        proofs.append(proof)
                     }
                 }
                 
@@ -106,8 +133,25 @@ public actor WalletRestorationService {
                 
                 currentIndex += 20
             }
+            } catch {
+                // Per-keyset isolation: a network hiccup or protocol error on ONE
+                // keyset must not abort the scan of the remaining keysets. The
+                // counter fast-forward below still runs for whatever this keyset's
+                // scan managed to see before failing.
+                cocoLog("⚠️ RESTORE: keyset \(kId) scan aborted mid-way: \(error) — continuing with remaining keysets")
+            }
+
+            // CRITICAL: fast-forward the NUT-13 counter past every index the mint
+            // signed. Without this, a wallet restored on a fresh device (counter 0)
+            // re-derives already-signed secrets on its next mint/swap — the mint
+            // rejects them (wallet bricked at this keyset) or re-issues a duplicate
+            // proof that is only spendable once.
+            if maxSignedIndex >= 0 {
+                try await manager.counterRepo.advance(key: kId, to: maxSignedIndex + 1)
+                cocoLog("⏩ RESTORE: advanced counter for keyset \(kId) to \(maxSignedIndex + 1)")
+            }
         }
-        
+
         return totalRestored
     }
     
@@ -163,7 +207,7 @@ public actor WalletRestorationService {
             // STRICT MODE:
             // If the Mint throws error (404/400), the tokens are INVALID.
             // Return empty list to discard them.
-            print("❌ RESTORE: Mint rejected tokens (\(error)). Discarding.")
+            cocoLog("❌ RESTORE: Mint rejected tokens (\(error)). Discarding.")
             return []
         }
     }

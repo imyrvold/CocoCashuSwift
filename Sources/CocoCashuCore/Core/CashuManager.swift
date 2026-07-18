@@ -13,6 +13,7 @@ public final class CashuManager: @unchecked Sendable {
   public let quoteService: QuoteService
   public let mintService: MintService
   public let blinding: BlindingEngine
+  public let counterRepo: CounterRepository
   private var plugins: [CashuPlugin] = []
   public let history: HistoryService
 
@@ -27,6 +28,7 @@ public final class CashuManager: @unchecked Sendable {
     events = EventBus()
     history = HistoryService(events: events)
     self.blinding = blinding
+    self.counterRepo = counterRepo
     let ps = ProofService(proofs: proofRepo, events: events)
     proofService = ps
     quoteService = QuoteService(quotes: quoteRepo, events: events)
@@ -60,7 +62,7 @@ public final class CashuManager: @unchecked Sendable {
         let proofsToSpend = try await proofService.reserve(amount: amount, mint: mint)
         
         do {
-            print("🚀 SEND: Swapping \(amount) sats at \(mint)...")
+            cocoLog("🚀 SEND: Swapping \(amount) sats at \(mint)...")
             
             // 2. NETWORK: Call the Mint to swap these proofs for new ones.
             // We request 'amount' for the recipient (sendable) + change for us.
@@ -83,14 +85,14 @@ public final class CashuManager: @unchecked Sendable {
             // B. Add the new "Change" proofs to our wallet.
             try await proofService.addNew(newProofs)
             
-            print("✅ SEND: Success! Token: \(tokenString.prefix(10))...")
+            cocoLog("✅ SEND: Success! Token: \(tokenString.prefix(10))...")
             return tokenString
             
         } catch {
             // 4. ROLLBACK: The network call failed (e.g. 400 Bad Request, 404, Internet Down).
             // We MUST release the reserved tokens so they show up in the balance again.
             
-            print("❌ SEND FAILED: \(error). Rolling back transaction...")
+            cocoLog("❌ SEND FAILED: \(error). Rolling back transaction...")
             try await proofService.unreserve(proofsToSpend.map(\.id), mint: mint)
             
             // Re-throw the error so the UI can show "Send Failed"

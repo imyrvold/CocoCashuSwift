@@ -6,15 +6,26 @@ public protocol MintAPI: Sendable {
     func checkQuoteStatus(mint: MintURL, invoice: String) async throws -> QuoteStatus
     func requestTokens(mint: MintURL, for invoice: String) async throws -> [Proof]
     func requestTokens(quoteId: String, blindedMessages: [BlindedOutput], mint: MintURL) async throws -> [BlindSignatureDTO]
-    func requestMeltQuote(mint: MintURL, amount: Int64, destination: String) async throws -> (quoteId: String, feeReserve: Int64)
+    func requestMeltQuote(mint: MintURL, amount: Int64, destination: String) async throws -> (quoteId: String, feeReserve: Int64, quotedAmount: Int64?)
     func executeMelt(mint: MintURL, quoteId: String, inputs: [Proof], outputs: [BlindedOutput]) async throws -> (preimage: String, change: [BlindSignatureDTO]?)
+    func checkMeltQuote(mint: MintURL, quoteId: String) async throws -> (state: MeltState, change: [BlindSignatureDTO]?)
     func swap(mint: MintURL, inputs: [Proof], outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO]
     func mint(quoteId: String, outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO]
-    func restore(mint: URL, outputs: [BlindedOutput]) async throws -> [BlindSignatureDTO]
+    /// NUT-09 restore. Returns the mint's echoed `outputs` (the matched blinded
+    /// messages, in response order) alongside the `promises` (blind signatures).
+    /// `outputs[i].B_` identifies which submitted output `promises[i]` belongs to,
+    /// so callers can pair each signature to the exact secret/r that produced it
+    /// instead of guessing.
+    func restore(mint: URL, outputs: [BlindedOutput]) async throws -> (outputs: [BlindedOutput], promises: [BlindSignatureDTO])
     func check(mint: URL, proofs: [ProofDTO]) async throws -> [CheckStateDTO]
     func fetchKeysetIds(mint: URL) async throws -> [String]
     func fetchKeyset(mint: URL, id: String) async throws -> Keyset
-    
+
+    /// NUT-02: Fetch the active keyset (incl. fee info) from a SPECIFIC mint.
+    /// Cross-mint flows (receiving a foreign token) must use this, not the
+    /// default-mint variant below.
+    func fetchKeyset(mint: URL) async throws -> Keyset
+
     /// NUT-02: Fetch the active keyset including fee information
     func fetchKeyset() async throws -> Keyset
     
@@ -41,59 +52,193 @@ public actor MintService {
     
     /// After invoice is paid, fetch minted proofs (receive tokens).
     
-    /// Spend tokens (melt) with Change handling
-    public func spend(amount: Int64, from mint: MintURL, to destination: String) async throws {
+    /// Ceiling on the melt fee reserve this wallet will sign inputs for without
+    /// refusing: the larger of 10 sats or 2% of the amount (Lightning routing
+    /// fees are typically ≤1%). The mint dictates `fee_reserve`, but accepting it
+    /// unbounded let a malicious mint quote e.g. 50,000 sats of "fee" on a
+    /// 100-sat invoice and silently keep the difference.
+    public static func maxAcceptableFeeReserve(forAmount amount: Int64) -> Int64 {
+        max(10, amount / 50)
+    }
+
+    /// Spend tokens (melt) with Change handling.
+    /// Returns `.paid` when the Lightning payment settles, or `.pending` when the
+    /// mint accepted the melt but the payment is still in flight after polling
+    /// (inputs parked for later reconciliation — the caller should present this as
+    /// "processing", not an error). Throws only on genuine failures: bad quote,
+    /// excessive fee, insufficient funds, or a definitive `meltUnpaid`.
+    @discardableResult
+    public func spend(amount: Int64, from mint: MintURL, to destination: String) async throws -> MeltResult {
+        guard amount > 0 else { throw CashuError.protocolError("Melt amount must be positive") }
+
         // 1. Get Quote & Fee Reserve
-        let (quoteId, feeReserve) = try await api.requestMeltQuote(mint: mint, amount: amount, destination: destination)
-        
+        let (quoteId, feeReserve, quotedAmount) = try await api.requestMeltQuote(mint: mint, amount: amount, destination: destination)
+
+        // The mint decodes the invoice itself; if its quoted amount disagrees with
+        // what the caller parsed client-side, one of the two is wrong (buggy local
+        // parser, or a mint quoting more than the invoice asks). Refuse rather than
+        // reserve/spend an amount the user never saw.
+        if let quoted = quotedAmount, quoted != amount {
+            throw CashuError.protocolError("Mint quoted \(quoted) sats for this invoice but the wallet expected \(amount) — aborting")
+        }
+
+        // Validate the mint-dictated fee before signing anything over: reject
+        // negative values, values that would overflow the sum, and values above
+        // the sanity ceiling.
+        guard feeReserve >= 0 else {
+            throw CashuError.protocolError("Mint quoted a negative fee reserve (\(feeReserve))")
+        }
+        let feeCap = Self.maxAcceptableFeeReserve(forAmount: amount)
+        guard feeReserve <= feeCap else {
+            throw CashuError.protocolError("Mint quoted an excessive fee reserve of \(feeReserve) sats for a \(amount) sat payment (max acceptable: \(feeCap)). Refusing to proceed.")
+        }
+
         // FIX: Add a small safety buffer (e.g., 3 sats) to handle fee spikes
         let safetyBuffer: Int64 = 3
-        let estimatedNeeded = amount + feeReserve
+        let (estimatedNeeded, overflowed) = amount.addingReportingOverflow(feeReserve)
+        guard !overflowed else {
+            throw CashuError.protocolError("Melt amount + fee overflows")
+        }
         
         // 2. Reserve inputs covering the Amount + Fee + Buffer
         // This ensures we satisfy the "Provided < Needed" check even if fees rise.
         let inputs = try await proofs.reserve(amount: estimatedNeeded + safetyBuffer, mint: mint)
-        
+        let totalInput = inputs.map(\.amount).reduce(0, +)
+
+        // PHASE A — Prepare change outputs. Any failure here happens BEFORE the melt
+        // is submitted, so the inputs are untouched at the mint and safe to release.
+        let outputs: [BlindedOutput]
+        var changeParts: [Int64] = []
         do {
-            // 3. Calculate Change
-            // We ask for everything back (Total Input - Estimated Cost).
-            // If the fee spikes, the Mint will consume part of this change, and our
-            // "missing signature" warning logic will handle the dropped change output gracefully.
-            let totalInput = inputs.map(\.amount).reduce(0, +)
             let changeAmt = totalInput - estimatedNeeded
-            
-            // ... (The rest of the logic remains exactly the same) ...
-            
-            let outputs: [BlindedOutput]
-            var changeParts: [Int64] = []
             if changeAmt > 0 {
                 changeParts = try await blinding.planOutputs(amount: changeAmt, mint: mint)
                 outputs = try await blinding.blind(parts: changeParts, mint: mint)
             } else {
                 outputs = []
             }
-            
-            let (_, changeSigs) = try await api.executeMelt(mint: mint, quoteId: quoteId, inputs: inputs, outputs: outputs)
-
-            if let sigs = changeSigs, !sigs.isEmpty, !changeParts.isEmpty {
-                // Unblind against the SAME outputs we sent to the mint — re-blinding
-                // here would derive different secrets and corrupt the change proofs.
-                let changeProofs = try await blinding.unblind(signatures: sigs, for: outputs, mint: mint)
-                try await proofs.addNew(changeProofs)
-            }
-            
-            try await proofs.markSpent(inputs.map(\.id), mint: mint)
-            
-            // RECORD HISTORY
-            // Fee is roughly (Inputs - Change - Sent Amount)
-            let totalChange = (changeSigs?.map(\.amount).reduce(0, +) ?? 0)
-            let actualFee = totalInput - totalChange - amount
-            
-            await history.add(CashuTransaction(type: .melt, amount: amount, fee: actualFee, memo: "Paid Lightning Invoice", status: .success))
         } catch {
             try? await proofs.unreserve(inputs.map(\.id), mint: mint)
             throw error
         }
+
+        // PHASE B — Submit the melt. Once this request leaves, the mint may consume
+        // the inputs even if we never see a clean response. The ONLY case where we
+        // return inputs to spendable is a definitive "unpaid"; a PENDING/ambiguous
+        // outcome goes to polling (below), never silently spendable.
+        var changeSigs: [BlindSignatureDTO]? = nil
+        var settled = false
+        do {
+            (_, changeSigs) = try await api.executeMelt(mint: mint, quoteId: quoteId, inputs: inputs, outputs: outputs)
+            settled = true   // mint returned PAID synchronously
+        } catch CashuError.meltUnpaid {
+            try? await proofs.unreserve(inputs.map(\.id), mint: mint)
+            throw CashuError.meltUnpaid
+        } catch {
+            // PENDING, timeout, or decode failure — the payment may be in flight.
+            // Fall through to polling the melt quote to resolve it in-session.
+            cocoLog("melt not settled synchronously (\(error)); polling melt quote…")
+        }
+
+        // PHASE B2 — Poll the NUT-05 melt quote until it settles. A small Lightning
+        // payment routinely reports PENDING on the first call, so we give it a
+        // window rather than surfacing that as a failure.
+        if !settled {
+            let outcome = await pollMeltUntilSettled(mint: mint, quoteId: quoteId)
+            switch outcome {
+            case .paid(let polledChange):
+                changeSigs = polledChange
+                settled = true
+            case .unpaid:
+                // Mint now reports the payment did not happen → safe to release.
+                try? await proofs.unreserve(inputs.map(\.id), mint: mint)
+                throw CashuError.meltUnpaid
+            case .stillPending:
+                // Genuinely unresolved after the window. Park the inputs and let the
+                // next launch's reconcilePending finish the job. This is NOT a
+                // failure — the payment may still complete.
+                try? await proofs.markPending(inputs.map(\.id), mint: mint)
+                await history.add(CashuTransaction(type: .melt, amount: amount, fee: 0, memo: "Payment processing", status: .pending))
+                return .pending
+            }
+        }
+
+        // PHASE C — Payment settled PAID, so the inputs ARE spent. Finalize that
+        // first; only then attempt change recovery. A change-processing failure must
+        // never resurrect the spent inputs, so it is caught and logged, not thrown.
+        try await proofs.markSpent(inputs.map(\.id), mint: mint)
+
+        if let sigs = changeSigs, !sigs.isEmpty, !changeParts.isEmpty {
+            do {
+                // Unblind against the SAME outputs we sent to the mint — re-blinding
+                // here would derive different secrets and corrupt the change proofs.
+                let changeProofs = try await blinding.unblind(signatures: sigs, for: outputs, mint: mint)
+                try await proofs.addNew(changeProofs)
+            } catch {
+                cocoLog("⚠️ Melt paid but change recovery failed (change lost): \(error)")
+            }
+        }
+
+        // RECORD HISTORY — Fee is roughly (Inputs - Change - Sent Amount)
+        let totalChange = (changeSigs?.map(\.amount).reduce(0, +) ?? 0)
+        let actualFee = totalInput - totalChange - amount
+        await history.add(CashuTransaction(type: .melt, amount: amount, fee: actualFee, memo: "Paid Lightning Invoice", status: .success))
+        return .paid(feePaid: max(0, actualFee))
+    }
+
+    private enum MeltPollOutcome { case paid([BlindSignatureDTO]?); case unpaid; case stillPending }
+
+    /// Poll the melt quote state until it resolves to PAID/UNPAID or the window
+    /// elapses. Transient poll errors (network blips) are ignored and retried —
+    /// only a definitive PAID/UNPAID ends the loop early. Runs on the actor, so a
+    /// concurrent operation still can't touch the reserved inputs meanwhile.
+    private func pollMeltUntilSettled(mint: MintURL, quoteId: String, timeout: TimeInterval = 90, interval: UInt64 = 2_000_000_000) async -> MeltPollOutcome {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: interval)
+            do {
+                let (state, change) = try await api.checkMeltQuote(mint: mint, quoteId: quoteId)
+                switch state {
+                case .paid: return .paid(change)
+                case .unpaid: return .unpaid
+                case .pending, .unknown: continue
+                }
+            } catch {
+                cocoLog("melt-quote poll error (will retry): \(error)")
+                continue
+            }
+        }
+        return .stillPending
+    }
+
+    /// Reconcile proofs parked as `.pending` by an ambiguous melt (NUT-07). For each,
+    /// ask the mint its state: SPENT → the payment went through, finalize as spent;
+    /// UNSPENT → the payment failed, return to spendable; PENDING → still in flight,
+    /// leave for a later pass. Safe to call on launch and after network recovery.
+    public func reconcilePending(mint: MintURL) async throws {
+        let pending = try await proofs.pendingProofs(mint: mint)
+        guard !pending.isEmpty else { return }
+
+        let dtos: [ProofDTO] = pending.compactMap { p in
+            guard let secretStr = String(data: p.secret, encoding: .utf8) else { return nil }
+            return ProofDTO(amount: p.amount, secret: secretStr, C: p.C, id: p.keysetId)
+        }
+        guard dtos.count == pending.count else { return }
+
+        let states = try await api.check(mint: mint, proofs: dtos)
+        guard states.count == pending.count else { return }
+
+        var spentIds: [ProofId] = []
+        var releaseIds: [ProofId] = []
+        for (i, s) in states.enumerated() {
+            switch s.state {
+            case .spent:   spentIds.append(pending[i].id)
+            case .unspent: releaseIds.append(pending[i].id)
+            case .pending: break
+            }
+        }
+        if !spentIds.isEmpty { try await proofs.markSpent(spentIds, mint: mint) }
+        if !releaseIds.isEmpty { try await proofs.unreserve(releaseIds, mint: mint) }
     }
     
     // MARK: - Ecash Operations
@@ -101,79 +246,93 @@ public actor MintService {
     /// Create a token string for a specific amount.
     /// This effectively "spends" the funds from your wallet and returns them as a token string.
     public func createToken(amount: Int64, from mint: MintURL, memo: String? = nil) async throws -> String {
-        // NUT-02: Fetch keyset to get dynamic fee info
-        let keyset = try await api.fetchKeyset()
+        // NUT-02: Fetch keyset to get dynamic fee info — from the mint we are
+        // actually spending at, not the default mint (their fees can differ).
+        let keyset = try await api.fetchKeyset(mint: mint)
         
         // Estimate fee for ~5 inputs as initial guess (will be refined after reserve)
         let estimatedFee = keyset.calculateFee(forInputCount: 5)
         let inputs = try await proofs.reserve(amount: amount + estimatedFee, mint: mint)
-        
-        // 1. Reserve Amount + Fee
+
+        // PHASE A — Everything before the swap request leaves the device. A failure
+        // here means the mint never saw the inputs, so releasing them is safe.
+        let tokenParts: [Int64]
+        let allParts: [Int64]
+        let allOutputs: [BlindedOutput]
+        let actualFee: Int64
         do {
             let totalInput = inputs.map(\.amount).reduce(0, +)
-            
+
             // NUT-02: Calculate actual fee based on number of inputs and keyset fee
-            let actualFee = keyset.calculateFee(forInputCount: inputs.count)
-            
+            actualFee = keyset.calculateFee(forInputCount: inputs.count)
+
             // Calculate change so everything balances EXACTLY
             // Available = Input - Fee. Token = amount. Change = Remainder.
             let changeAmt = totalInput - actualFee - amount
-            
+
             guard changeAmt >= 0 else {
-                // If our initial estimate (3) was too low and we picked too many small inputs (e.g. 5 inputs = 5 fee),
-                // we might be short. In that rare case, we just fail and tell user to try again (or handle retry).
+                // If our initial estimate was too low and we picked too many small
+                // inputs, we might be short. Fail and let the user retry.
                 throw CashuError.insufficientFunds
             }
-            
-            // Plan Token Parts
-            let tokenParts = try await blinding.planOutputs(amount: amount, mint: mint)
-            // Plan Change Parts
-            let changeParts = (changeAmt > 0) ? try await blinding.planOutputs(amount: changeAmt, mint: mint) : []
-            
-            // Blind everything
-            let allParts = tokenParts + changeParts
-            
-            // 2. Blind ONCE (blinding twice would derive a second, different set of
-            //    secrets and unblind against the wrong factors, producing invalid proofs).
-            let allOutputs = try await blinding.blind(parts: allParts, mint: mint)
 
-            // 3. Swap
-            let signatures = try await api.swap(mint: mint, inputs: inputs, outputs: allOutputs)
-            // 4. Unblind Everything (against the SAME outputs we sent)
-            let allProofs = try await blinding.unblind(signatures: signatures, for: allOutputs, mint: mint)
-            
-            // 5. Split the results back into Token vs Change
-            // We know the first N proofs correspond to the tokenParts
-            let tokenCount = tokenParts.count
-            
-            // Safety check
+            tokenParts = try await blinding.planOutputs(amount: amount, mint: mint)
+            let changeParts = (changeAmt > 0) ? try await blinding.planOutputs(amount: changeAmt, mint: mint) : []
+            allParts = tokenParts + changeParts
+
+            // Blind ONCE (blinding twice would derive a second, different set of
+            // secrets and unblind against the wrong factors, producing invalid proofs).
+            allOutputs = try await blinding.blind(parts: allParts, mint: mint)
+        } catch {
+            try? await proofs.unreserve(inputs.map(\.id), mint: mint)
+            throw error
+        }
+
+        // PHASE B — Submit the swap. Once the request is out, the mint may have
+        // consumed the inputs even without a clean response, so an error here parks
+        // them `.pending` for NUT-07 reconciliation — NOT back to spendable (risking
+        // double-spend) and NOT stranded `.reserved` forever (the old bug: this
+        // block had no catch at all).
+        let signatures: [BlindSignatureDTO]
+        do {
+            signatures = try await api.swap(mint: mint, inputs: inputs, outputs: allOutputs)
+        } catch {
+            try? await proofs.markPending(inputs.map(\.id), mint: mint)
+            throw error
+        }
+
+        // PHASE C — The mint answered: the swap happened and the inputs are spent.
+        // Failures past this point must not resurrect them.
+        let allProofs: [Proof]
+        do {
+            allProofs = try await blinding.unblind(signatures: signatures, for: allOutputs, mint: mint)
             guard allProofs.count == allParts.count else {
-                // If mint dropped a change output due to fee miscalculation, handle gracefully
-                // Usually, token proofs come first because we passed them first in 'allParts'
-                // But 'unblind' might have skipped some if signatures were missing.
-                // For a robust implementation, filter by the amounts in tokenParts.
                 throw CashuError.protocolError("Mismatch in returned proofs count")
             }
-            
-            let tokenProofs = Array(allProofs.prefix(tokenCount))
-            let changeProofs = Array(allProofs.suffix(from: tokenCount))
-            
-            // 6. Store Change, Mark Inputs Spent
-            if !changeProofs.isEmpty { try await proofs.addNew(changeProofs) }
-            try await proofs.markSpent(inputs.map(\.id), mint: mint)
-            
-            // 7. Record History
-            await history.add(CashuTransaction(
-                type: .sendEcash,
-                amount: amount,
-                fee: actualFee,
-                memo: "Created Token",
-                status: .success
-            ))
-            
-            // 8. Serialize
-            return try TokenHelper.serialize(tokenProofs, mint: mint, memo: memo)
+        } catch {
+            // Inputs are spent at the mint; the swapped-for proofs are recoverable
+            // via a seed restore scan. Marking spent keeps local state truthful.
+            try? await proofs.markSpent(inputs.map(\.id), mint: mint)
+            throw error
         }
+
+        let tokenCount = tokenParts.count
+        let tokenProofs = Array(allProofs.prefix(tokenCount))
+        let changeProofs = Array(allProofs.suffix(from: tokenCount))
+
+        // Store Change, Mark Inputs Spent
+        if !changeProofs.isEmpty { try await proofs.addNew(changeProofs) }
+        try await proofs.markSpent(inputs.map(\.id), mint: mint)
+
+        await history.add(CashuTransaction(
+            type: .sendEcash,
+            amount: amount,
+            fee: actualFee,
+            memo: "Created Token",
+            status: .success
+        ))
+
+        return try TokenHelper.serialize(tokenProofs, mint: mint, memo: memo)
     }
     
     /// Swaps specific proofs for a target amount (to send) + change.
@@ -184,9 +343,10 @@ public actor MintService {
         
         // 1. Calculate Input Total
         let totalInput = inputProofs.map(\.amount).reduce(0, +)
-        
-        // NUT-02: Calculate fee dynamically based on keyset fee info
-        let keyset = try await api.fetchKeyset()
+
+        // NUT-02: Calculate fee dynamically based on keyset fee info — from the
+        // mint whose proofs we are swapping, not the default mint.
+        let keyset = try await api.fetchKeyset(mint: mint)
         let fee = keyset.calculateFee(forInputCount: inputProofs.count)
         
         // 2. Calculate Change

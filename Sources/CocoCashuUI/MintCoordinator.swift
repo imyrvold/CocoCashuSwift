@@ -39,7 +39,7 @@ public final class MintCoordinator {
     public func receiveTokens(mint: URL, invoice: String?, quoteId: String?, amount: Int64?) async throws {
         // 1. Prefer the modern Quote flow (NUT-04)
         if let qid = quoteId, let amt = amount {
-            print("MintCoordinator: executing mint for quote \(qid)")
+            cocoLog("MintCoordinator: executing mint for quote \(qid)")
             // This function (which you likely have defined elsewhere) handles the full blinding/unblinding cycle
             try await executePaidQuote(mint: mint, quoteId: qid, amount: amt)
             return
@@ -64,7 +64,7 @@ public final class MintCoordinator {
     // MARK: - Private Helpers
         
     private func executePaidQuote(mint: URL, quoteId: String, amount: Int64) async throws {
-        print("⚡️ MINT: Starting mint flow for \(amount) sats (Quote: \(quoteId))")
+        cocoLog("⚡️ MINT: Starting mint flow for \(amount) sats (Quote: \(quoteId))")
         
         // 1. Plan and Blind
         // We generate the secrets here. We must keep 'blindedOutputs' in memory
@@ -90,19 +90,21 @@ public final class MintCoordinator {
             
             // Check for "Already Signed" (Error 10002)
             if errorString.contains("already been signed") || errorString.contains("10002") {
-                print("⚠️ Network Glitch Detected: Mint already signed these outputs. Attempting RESTORE...")
+                cocoLog("⚠️ Network Glitch Detected: Mint already signed these outputs. Attempting RESTORE...")
                 
                 // Try to cast to RealMintAPI to access the specific 'restore' endpoint
                 if let realApi = api as? RealMintAPI {
-                    signatures = try await realApi.restore(mint: mint, outputs: blindedOutputs)
-                    print("✅ RESTORE SUCCESS: Recovered \(signatures.count) signatures!")
+                    // Recovery path: we submitted exactly these outputs, so the promises
+                    // map back to them by amount in unblind(); we only need the promises.
+                    signatures = try await realApi.restore(mint: mint, outputs: blindedOutputs).promises
+                    cocoLog("✅ RESTORE SUCCESS: Recovered \(signatures.count) signatures!")
                 } else {
-                    print("❌ Restore failed: API is not RealMintAPI")
+                    cocoLog("❌ Restore failed: API is not RealMintAPI")
                     throw error
                 }
             } else {
                 // Genuine failure (e.g. Quote not paid yet)
-                print("❌ MINT FAILED: \(error)")
+                cocoLog("❌ MINT FAILED: \(error)")
                 throw error
             }
         }
@@ -118,7 +120,7 @@ public final class MintCoordinator {
         await manager.history.add(CashuTransaction(type: .mint, amount: total, fee: 0, memo: "Minted via Lightning", status: .success))
         manager.events.emit(.proofsUpdated(mint: mint))
 
-        print("✅ MINT COMPLETE: Added \(total) sats to wallet.")
+        cocoLog("✅ MINT COMPLETE: Added \(total) sats to wallet.")
     }
     
     private func saveProofs(_ proofs: [Proof], mint: URL) async throws {
@@ -131,18 +133,30 @@ public final class MintCoordinator {
     // MARK: - Receive (Swap) Logic
 
     public func receive(token: String) async throws {
-        print("📥 RECEIVE: Processing token...")
+        cocoLog("📥 RECEIVE: Processing token...")
         
         // 1. Parse the Token
         // We decode the string to get the proofs and the Mint URL.
         let (proofs, mintUrl) = try parseToken(token)
-        
-        let totalAmount = proofs.reduce(0) { $0 + $1.amount }
+
+        // Every proof amount must be positive, and the total must not overflow —
+        // a crafted token with a negative or Int64.max amount would otherwise
+        // corrupt fee math or trap the app.
+        var totalAmount: Int64 = 0
+        for p in proofs {
+            guard p.amount > 0 else { throw CashuError.invalidToken }
+            let (sum, overflow) = totalAmount.addingReportingOverflow(p.amount)
+            guard !overflow else { throw CashuError.invalidToken }
+            totalAmount = sum
+        }
 
         // NUT-02: the swap fee is dictated by the keyset's input_fee_ppk, not a fixed
         // guess. Hardcoding 1 made outputs short by 1 on zero-fee mints (e.g. cashu.cz),
         // so the mint rejected the swap as "not balanced" (code 11000).
-        let keyset = try await api.fetchKeyset()
+        // Fetch it from the TOKEN's mint — the fee keyset, blinding keyset, and swap
+        // endpoint must all be the same mint or a foreign token's receive derives
+        // outputs against one server and submits proofs to another.
+        let keyset = try await api.fetchKeyset(mint: mintUrl)
         let estimatedFee = keyset.calculateFee(forInputCount: proofs.count)
         let amountToReceive = totalAmount - estimatedFee
 
@@ -150,7 +164,7 @@ public final class MintCoordinator {
             throw CashuError.cryptoError("Fee (\(estimatedFee)) exceeds token value (\(totalAmount))")
         }
 
-        print("📥 RECEIVE: Input \(totalAmount) - Fee \(estimatedFee) = \(amountToReceive) sats")
+        cocoLog("📥 RECEIVE: Input \(totalAmount) - Fee \(estimatedFee) = \(amountToReceive) sats")
         
         // 4. Split into powers of 2 (Standard Cashu Logic)
         // e.g. If amountToReceive is 3, this returns [1, 2]
@@ -171,12 +185,12 @@ public final class MintCoordinator {
                 try await manager.proofService.addNew(newProofs)
                 await manager.history.add(CashuTransaction(type: .receiveEcash, amount: amountToReceive, fee: estimatedFee, memo: "Received Ecash", status: .success))
                 manager.events.emit(.proofsUpdated(mint: mintUrl))
-                print("✅ CLAIM COMPLETE: Added \(amountToReceive) sats to wallet.")
+                cocoLog("✅ CLAIM COMPLETE: Added \(amountToReceive) sats to wallet.")
                 return
             } catch {
                 lastError = error
                 if Self.isOutputCollision(error), attempt < maxAttempts {
-                    print("⚠️ RECEIVE: outputs collided (attempt \(attempt)/\(maxAttempts)) — retrying with fresh derivation indices…")
+                    cocoLog("⚠️ RECEIVE: outputs collided (attempt \(attempt)/\(maxAttempts)) — retrying with fresh derivation indices…")
                     continue
                 }
                 throw error
@@ -197,13 +211,58 @@ public final class MintCoordinator {
     }
     
     // MARK: - Token Parsing Helper
+
+    /// Bounds on untrusted pasted/scanned tokens: without them a crafted blob with
+    /// millions of proofs is fully decoded and then drives a keyset-fetch/blind/swap
+    /// loop — a memory-and-network DoS from one paste.
+    private static let maxTokenLength = 100_000
+    private static let maxProofCount = 512
+
     private func parseToken(_ token: String) throws -> ([Proof], URL) {
         // 1. Basic Validation
-        guard token.lowercased().hasPrefix("cashu"), token.count > 6 else {
+        guard token.count > 6, token.count <= Self.maxTokenLength else {
             throw CashuError.invalidToken
         }
-        
-        // 2. Remove Prefix & Base64 Decode
+
+        // 2. Dispatch by NUT-00 version: cashuA = V3 (base64 JSON),
+        //    cashuB = V4 (base64 CBOR — what Minibits/cashu.me send by default).
+        if token.hasPrefix("cashuB") {
+            return try parseTokenV4(token)
+        }
+        guard token.lowercased().hasPrefix("cashu") else {
+            throw CashuError.invalidToken
+        }
+        return try parseTokenV3(token)
+    }
+
+    private func parseTokenV4(_ token: String) throws -> ([Proof], URL) {
+        let decoded = try TokenV4Helper.deserialize(token)
+        guard decoded.proofs.count <= Self.maxProofCount,
+              let url = URL(string: decoded.mint) else {
+            throw CashuError.invalidToken
+        }
+        // V4 tokens carry a unit; this wallet only handles sats.
+        if let unit = decoded.unit, unit.lowercased() != "sat" {
+            throw CashuError.protocolError("Unsupported token unit '\(unit)' — only sat is supported")
+        }
+        try RealMintAPI.requireSecure(url)
+
+        let proofs: [Proof] = decoded.proofs.compactMap { p in
+            guard let secretData = p.secret.data(using: .utf8) else { return nil }
+            return Proof(
+                amount: p.amount,
+                mint: url,
+                secret: secretData,
+                C: p.C,
+                keysetId: p.keysetId
+            )
+        }
+        guard !proofs.isEmpty else { throw CashuError.invalidToken }
+        return (proofs, url)
+    }
+
+    private func parseTokenV3(_ token: String) throws -> ([Proof], URL) {
+        // Remove Prefix & Base64 Decode
         let idx = token.index(token.startIndex, offsetBy: 6) // Skip "cashuA"
         let b64 = String(token[idx...])
             .replacingOccurrences(of: "-", with: "+")
@@ -211,12 +270,12 @@ public final class MintCoordinator {
 
         // Add padding if needed
         let padded = b64.padding(toLength: ((b64.count + 3) / 4) * 4, withPad: "=", startingAt: 0)
-        
+
         guard let data = Data(base64Encoded: padded) else {
             throw CashuError.invalidToken
         }
-        
-        // 3. Decode JSON (NUT-00 standard)
+
+        // Decode JSON (NUT-00 standard)
         struct TokenV3: Decodable {
             struct TokenEntry: Decodable {
                 let mint: String?
@@ -224,7 +283,7 @@ public final class MintCoordinator {
             }
             let token: [TokenEntry]
         }
-        
+
         // Temporary struct to decode proofs safely
         struct DecodeProof: Decodable {
             let amount: Int64
@@ -232,26 +291,28 @@ public final class MintCoordinator {
             let C: String
             let id: String?
         }
-        
+
         let root = try JSONDecoder().decode(TokenV3.self, from: data)
         guard let entry = root.token.first, let mintString = entry.mint, let url = URL(string: mintString) else {
             throw CashuError.invalidToken
         }
+        guard entry.proofs.count <= Self.maxProofCount else {
+            throw CashuError.invalidToken
+        }
+        // A token naming an http:// mint is either broken or a downgrade attempt;
+        // refuse it explicitly instead of failing later with an opaque error.
+        try RealMintAPI.requireSecure(url)
 
-        // 4. Convert to your App's Proof Model
+        // Convert to your App's Proof Model. NUT-00 secrets are plain UTF-8
+        // strings — do NOT try base64 first: a 64-char hex secret is coincidentally
+        // valid base64 and would silently decode into garbage bytes, making the
+        // proof unspendable at the mint.
         let proofs = entry.proofs.compactMap { p -> Proof? in
-            var secretData = Data(base64Encoded: p.secret)
-            if secretData == nil {
-                secretData = p.secret.data(using: .utf8)
-            }
-            
-            guard let validSecret = secretData else { return nil }
-            
+            guard let secretData = p.secret.data(using: .utf8) else { return nil }
             return Proof(
                 amount: p.amount,
                 mint: url,
-                // CRITICAL: Convert the secret string to Data (UTF8)
-                secret: validSecret,
+                secret: secretData,
                 C: p.C,
                 keysetId: p.id ?? ""
             )
