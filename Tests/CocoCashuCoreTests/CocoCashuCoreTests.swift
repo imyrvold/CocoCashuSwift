@@ -12,6 +12,90 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertEqual(fetched.count, 1)
   }
 
+  // MARK: - FileProofRepository persistence
+
+  private func tempProofURL() -> URL {
+    FileManager.default.temporaryDirectory
+      .appendingPathComponent("coco-proofs-\(UUID().uuidString).json")
+  }
+
+  private func makeProof(_ amount: Int64, c: String, state: ProofState = .unspent) -> Proof {
+    Proof(amount: amount, mint: URL(string: "https://mint.test")!,
+          secret: Data("secret-\(c)".utf8), C: c, keysetId: "009a1f293253e41e", state: state)
+  }
+
+  /// Proofs must survive a repository re-open (the balance the wallet relaunches to).
+  func testFileProofRepoRoundTripsAcrossReopen() async throws {
+    let url = tempProofURL()
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let repo = FileProofRepository(url: url)
+    try await repo.insertMany([makeProof(8, c: "02aa"), makeProof(2, c: "02bb")])
+
+    let reopened = FileProofRepository(url: url)
+    let unspent = try await reopened.fetchUnspent(mint: nil)
+    XCTAssertEqual(unspent.map(\.amount).reduce(0, +), 10)
+    XCTAssertEqual(Set(unspent.map(\.C)), ["02aa", "02bb"])
+  }
+
+  /// Spent proofs are dropped on persist (bounds file growth); pending survive.
+  func testFileProofRepoPersistsPendingButNotSpent() async throws {
+    let url = tempProofURL()
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let repo = FileProofRepository(url: url)
+    let spent = makeProof(4, c: "02cc")
+    let pending = makeProof(1, c: "02dd")
+    try await repo.insert(spent)
+    try await repo.insert(pending)
+    try await repo.updateState(ids: [spent.id], to: .spent)
+    try await repo.updateState(ids: [pending.id], to: .pending)
+
+    let reopened = FileProofRepository(url: url)
+    let allPending = try await reopened.fetchPending(mint: nil)
+    XCTAssertEqual(allPending.map(\.C), ["02dd"], "pending must persist")
+    // Spent proof must be gone entirely (not persisted).
+    let unspent = try await reopened.fetchUnspent(mint: nil)
+    XCTAssertTrue(unspent.isEmpty)
+  }
+
+  /// A reserved proof from a killed session reloads as pending, so launch
+  /// reconciliation resolves it instead of it looking spendable.
+  func testFileProofRepoReloadsReservedAsPending() async throws {
+    let url = tempProofURL()
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let repo = FileProofRepository(url: url)
+    let p = makeProof(16, c: "02ee")
+    try await repo.insert(p)
+    try await repo.reserve(ids: [p.id], until: Date().addingTimeInterval(300))
+
+    let reopened = FileProofRepository(url: url)
+    let unspent = try await reopened.fetchUnspent(mint: nil)
+    let pending = try await reopened.fetchPending(mint: nil)
+    XCTAssertTrue(unspent.isEmpty, "reserved must not reload as spendable")
+    XCTAssertEqual(pending.map(\.C), ["02ee"], "reserved reloads as pending")
+  }
+
+  /// Existing wallets wrote a legacy StoredProof file; the repo must migrate it
+  /// so balances aren't lost on upgrade.
+  func testFileProofRepoMigratesLegacyFormat() async throws {
+    let url = tempProofURL()
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let legacy = """
+    [{"amount":21,"mint":"https://mint.test","secretBase64":"\(Data("legacy-secret".utf8).base64EncodedString())","C":"02ff","keysetId":"009a1f293253e41e","state":"unspent"}]
+    """
+    try Data(legacy.utf8).write(to: url)
+
+    let repo = FileProofRepository(url: url)
+    let unspent = try await repo.fetchUnspent(mint: nil)
+    XCTAssertEqual(unspent.count, 1)
+    XCTAssertEqual(unspent.first?.amount, 21)
+    XCTAssertEqual(unspent.first?.C, "02ff")
+    XCTAssertEqual(unspent.first?.secret, Data("legacy-secret".utf8))
+  }
+
   // MARK: - NUT-13 counter
 
   func testInMemoryCounterReservesFromZeroAndAdvances() async throws {

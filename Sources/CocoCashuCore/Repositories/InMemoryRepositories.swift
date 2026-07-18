@@ -1,126 +1,117 @@
 // InMemoryRepositories.swift
 import Foundation
 
+/// In-memory proof repository (tests, previews). Production wallets should use
+/// `FileProofRepository` so balances survive relaunch. All bookkeeping lives in
+/// the shared `ProofStore` so the two repositories cannot diverge.
 public actor InMemoryProofRepository: ProofRepository {
-    // CHANGE: Key is now the Signature (C), not the random ID.
-    // This physically prevents duplicates.
-    private var store: [String: Proof] = [:]
-    
+    private var store = ProofStore()
+
     public init() {}
-    
-    private func areSameMint(_ u1: URL, _ u2: URL) -> Bool {
-        let s1 = u1.absoluteString.trimmingCharacters(in: .init(charactersIn: "/"))
-        let s2 = u2.absoluteString.trimmingCharacters(in: .init(charactersIn: "/"))
-        return s1 == s2
-    }
-    
-    public func insert(_ proof: Proof) async throws {
-        // Always overwrite based on C (Signature)
-        store[proof.C] = proof
-    }
-    
-    public func insertMany(_ proofs: [Proof]) async throws {
-        for p in proofs {
-            if let existing = store[p.C] {
-                // TOKEN EXISTS: Merge/Update it
-                var updated = existing
-                
-                // 1. Force Metadata Update (Fixes URL/Keyset issues)
-                updated.mint = p.mint
-                updated.keysetId = p.keysetId
-                
-                // 2. Revive if newly found as unspent
-                if updated.state != .unspent && p.state == .unspent {
-                    cocoLog("✨ Reviving spent token: \(p.amount) sats")
-                    updated.state = .unspent
-                } else {
-                    // It's already fine, just updated metadata
-                    cocoLog("🔄 Synced duplicate token: \(p.amount) sats")
-                }
-                
-                store[p.C] = updated
-                
-            } else {
-                // NEW TOKEN
-                store[p.C] = p
-                cocoLog("✅ Added new token: \(p.amount) sats")
-            }
-        }
-    }
-    
+
+    public func insert(_ proof: Proof) async throws { store.insert(proof) }
+    public func insertMany(_ proofs: [Proof]) async throws { store.insertMany(proofs) }
+
     public func fetchUnspent(mint: MintURL?) async throws -> [Proof] {
-        releaseExpiredReservations()
-        if let m = mint {
-            return store.values.filter {
-                $0.state == .unspent && areSameMint($0.mint, m)
-            }
-        }
-        return store.values.filter { $0.state == .unspent }
+        store.releaseExpired(now: Date())
+        return store.proofs(state: .unspent, mint: mint)
+    }
+    public func fetchPending(mint: MintURL?) async throws -> [Proof] { store.proofs(state: .pending, mint: mint) }
+    public func fetchReserved(mint: MintURL?) async throws -> [Proof] { store.proofs(state: .reserved, mint: mint) }
+
+    public func updateState(ids: [ProofId], to state: ProofState) async throws { store.updateState(ids: ids, to: state) }
+    public func reserve(ids: [ProofId], until: Date) async throws { store.reserve(ids: ids, until: until) }
+    public func delete(ids: [ProofId]) async throws { store.delete(ids: ids) }
+}
+
+/// Disk-backed proof repository: the single source of truth for stored money.
+/// Loads on init and persists after every mutation with the same atomicity and
+/// file-protection guarantees as `FileCounterRepository`. This replaces the
+/// app-side hand-rolled persistence (event-driven save + `StoredProof`
+/// translation) that caused the double-writer race and the reserved/pending
+/// persistence bugs.
+public actor FileProofRepository: ProofRepository {
+    private let url: URL
+    private var store: ProofStore
+
+    public init(url: URL) {
+        self.url = url
+        self.store = Self.load(from: url)
     }
 
-    /// Enforce the reservation timeout: a proof whose `reservedUntil` has passed
-    /// was reserved by an operation that died without cleaning up — release it so
-    /// funds don't stay stranded forever. (`.pending` proofs are NOT touched; they
-    /// were knowingly submitted to the mint and only NUT-07 may release them.)
-    private func releaseExpiredReservations() {
-        let now = Date()
-        for (key, proof) in store where proof.state == .reserved {
-            if let until = proof.reservedUntil, until < now {
-                var p = proof
-                p.state = .unspent
-                p.reservedUntil = nil
-                store[key] = p
-            }
+    // MARK: Loading & migration
+
+    private static func load(from url: URL) -> ProofStore {
+        guard let data = try? Data(contentsOf: url) else { return ProofStore() }
+        // Current format: an array of Proof.
+        if let proofs = try? JSONDecoder().decode([Proof].self, from: data) {
+            return ProofStore(recover(proofs))
+        }
+        // Legacy format written by the app's StoredProof/WalletStoredProof. Decode
+        // and convert so an upgrading user's balance is preserved (the two JSON
+        // shapes are mutually exclusive, so this only triggers on real old files).
+        if let legacy = try? JSONDecoder().decode([LegacyStoredProof].self, from: data) {
+            return ProofStore(recover(legacy.compactMap { $0.toProof() }))
+        }
+        return ProofStore()
+    }
+
+    /// A proof persisted as `.reserved` belonged to an operation the app died
+    /// mid-way through; its outcome is unknown, so load it as `.pending` for
+    /// NUT-07 reconciliation rather than treating it as spendable.
+    private static func recover(_ proofs: [Proof]) -> [Proof] {
+        proofs.map { p in
+            guard p.state == .reserved else { return p }
+            var c = p
+            c.state = .pending
+            c.reservedUntil = nil
+            return c
         }
     }
 
-    public func fetchPending(mint: MintURL?) async throws -> [Proof] {
-        if let m = mint {
-            return store.values.filter {
-                $0.state == .pending && areSameMint($0.mint, m)
-            }
-        }
-        return store.values.filter { $0.state == .pending }
+    // MARK: Persistence
+
+    private func persist() {
+        guard let data = try? JSONEncoder().encode(store.persistable) else { return }
+        var options: Data.WritingOptions = [.atomic]
+        #if os(iOS)
+        options.insert(.completeFileProtection)
+        #endif
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: options)
     }
 
-    public func fetchReserved(mint: MintURL?) async throws -> [Proof] {
-        if let m = mint {
-            return store.values.filter {
-                $0.state == .reserved && areSameMint($0.mint, m)
-            }
-        }
-        return store.values.filter { $0.state == .reserved }
-    }
+    // MARK: ProofRepository
 
-    public func updateState(ids: [ProofId], to state: ProofState) async throws {
-        // Since we changed the key to C, we need to iterate to find by ID
-        // (Performance note: In a real DB, you'd index ID too. For memory, this is fine.)
-        for id in ids {
-            if let found = store.values.first(where: { $0.id == id }) {
-                var p = found
-                p.state = state
-                store[p.C] = p
-            }
-        }
+    public func insert(_ proof: Proof) async throws { store.insert(proof); persist() }
+    public func insertMany(_ proofs: [Proof]) async throws { store.insertMany(proofs); persist() }
+
+    public func fetchUnspent(mint: MintURL?) async throws -> [Proof] {
+        if store.releaseExpired(now: Date()) { persist() }
+        return store.proofs(state: .unspent, mint: mint)
     }
-    
-    public func reserve(ids: [ProofId], until: Date) async throws {
-        for id in ids {
-            if let found = store.values.first(where: { $0.id == id }) {
-                var p = found
-                p.reservedUntil = until
-                p.state = .reserved
-                store[p.C] = p
-            }
-        }
-    }
-    
-    public func delete(ids: [ProofId]) async throws {
-        for id in ids {
-            if let found = store.values.first(where: { $0.id == id }) {
-                store.removeValue(forKey: found.C)
-            }
-        }
+    public func fetchPending(mint: MintURL?) async throws -> [Proof] { store.proofs(state: .pending, mint: mint) }
+    public func fetchReserved(mint: MintURL?) async throws -> [Proof] { store.proofs(state: .reserved, mint: mint) }
+
+    public func updateState(ids: [ProofId], to state: ProofState) async throws { store.updateState(ids: ids, to: state); persist() }
+    public func reserve(ids: [ProofId], until: Date) async throws { store.reserve(ids: ids, until: until); persist() }
+    public func delete(ids: [ProofId]) async throws { store.delete(ids: ids); persist() }
+}
+
+/// Legacy on-disk proof shape written by earlier app builds (CashuBootstrap's
+/// `StoredProof` / ObservableWallet's `WalletStoredProof`). Kept only to migrate
+/// existing wallets to the `[Proof]` format on first launch of a new build.
+struct LegacyStoredProof: Decodable {
+    let amount: Int64
+    let mint: String
+    let secretBase64: String
+    let C: String
+    let keysetId: String
+    var state: ProofState?
+
+    func toProof() -> Proof? {
+        guard let mintURL = URL(string: mint), let secret = Data(base64Encoded: secretBase64) else { return nil }
+        return Proof(amount: amount, mint: mintURL, secret: secret, C: C, keysetId: keysetId, state: state ?? .unspent)
     }
 }
 
