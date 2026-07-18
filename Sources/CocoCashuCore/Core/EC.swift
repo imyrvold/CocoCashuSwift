@@ -139,3 +139,36 @@ func ec_negate(_ P: inout secp256k1_pubkey) throws -> secp256k1_pubkey {
     return pk
   }
 }
+
+// MARK: - NUT-00 hash_to_curve
+
+/// NUT-00 hash-to-curve. MUST match the mint exactly or proofs never verify:
+///   msg = sha256("Secp256k1_HashToCurve_Cashu_" || x)
+///   Y   = lift_x(0x02 || sha256(msg || counter_le32)), incrementing counter
+///         until a valid x-coordinate is found.
+/// Free function (not engine-bound) because both the blinding engine and the
+/// NUT-07 checkstate request need it — the mint identifies proofs by Y, never
+/// by their raw secrets.
+private let cashuHashToCurveDomain = Data("Secp256k1_HashToCurve_Cashu_".utf8)
+
+func cashu_hash_to_curve(_ message: Data) throws -> secp256k1_pubkey {
+  let msgHash = sha256(cashuHashToCurveDomain + message)
+  var counter: UInt32 = 0
+  while counter < 1_000 {
+    var toHash = msgHash
+    withUnsafeBytes(of: counter.littleEndian) { toHash.append(contentsOf: $0) }
+    let attemptBytes = Data([0x02]) + sha256(toHash)
+    if let Y = try? ec_parse_pubkey(attemptBytes) {
+      return Y
+    }
+    counter += 1
+  }
+  throw ECError.parsePubKey
+}
+
+/// Compressed hex of Y = hash_to_curve(secret) — the identifier NUT-07
+/// checkstate uses for a proof.
+func cashu_Y_hex(secret: Data) throws -> String {
+  var Y = try cashu_hash_to_curve(secret)
+  return try ec_serialize_pubkey(&Y).hexString
+}

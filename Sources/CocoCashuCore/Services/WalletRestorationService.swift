@@ -188,21 +188,26 @@ public actor WalletRestorationService {
             guard let secretStr = String(data: p.secret, encoding: .utf8) else { return nil }
             return ProofDTO(amount: p.amount, secret: secretStr, C: p.C, id: p.keysetId)
         }
-        guard !dtos.isEmpty else { return [] }
-        
+        guard !dtos.isEmpty, dtos.count == proofs.count else { return [] }
+
         do {
-            // Ask Mint: "Are these unspent?"
-            let state = try await manager.mintService.api.check(mint: mint, proofs: dtos)
-            guard state.count == dtos.count else { return [] }
-            
+            // NUT-07: ask the mint the state of each proof, identified by
+            // Y = hash_to_curve(secret). Match the response BY Y — a mint that
+            // reorders states must not cause valid proofs to be discarded or
+            // spent ones kept (positional matching was audit finding L4).
+            let states = try await manager.mintService.api.check(mint: mint, proofs: dtos)
+            let stateByY = Dictionary(states.map { ($0.Y.lowercased(), $0.state) },
+                                      uniquingKeysWith: { first, _ in first })
+
             var valid: [Proof] = []
-            for (index, item) in state.enumerated() {
-                if item.state == .unspent {
-                    valid.append(proofs[index])
+            for proof in proofs {
+                guard let y = try? cashu_Y_hex(secret: proof.secret) else { continue }
+                if stateByY[y] == .unspent {
+                    valid.append(proof)
                 }
             }
             return valid
-            
+
         } catch {
             // STRICT MODE:
             // If the Mint throws error (404/400), the tokens are INVALID.

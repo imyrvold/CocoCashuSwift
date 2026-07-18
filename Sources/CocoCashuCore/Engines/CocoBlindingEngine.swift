@@ -351,27 +351,14 @@ public actor CocoBlindingEngine: BlindingEngine {
         }
     }
     
-    /// NUT-00 hash-to-curve. MUST match the mint exactly or proofs never verify:
-    ///   msg  = sha256("Secp256k1_HashToCurve_Cashu_" || x)
-    ///   Y    = lift_x(0x02 || sha256(msg || counter_le32)), incrementing counter
-    ///          until a valid x-coordinate is found.
-    /// (The earlier sha256(x)-with-no-domain-separator version is the deprecated
-    /// pre-2023 scheme and is incompatible with modern mints.)
-    private static let hashToCurveDomain = Data("Secp256k1_HashToCurve_Cashu_".utf8)
-
+    /// NUT-00 hash-to-curve — delegates to the shared Core implementation
+    /// (`cashu_hash_to_curve`), which the NUT-07 checkstate request also uses.
     func hash_to_curve(_ message: Data) throws -> secp256k1_pubkey {
-        let msgHash = sha256(Self.hashToCurveDomain + message)
-        var counter: UInt32 = 0
-        while counter < 1_000 {
-            var toHash = msgHash
-            withUnsafeBytes(of: counter.littleEndian) { toHash.append(contentsOf: $0) }
-            let attemptBytes = Data([0x02]) + sha256(toHash)
-            if let Y = try? ec_parse_pubkey(attemptBytes) {
-                return Y
-            }
-            counter += 1
+        do {
+            return try cashu_hash_to_curve(message)
+        } catch {
+            throw CashuError.cryptoError("Could not hash secret to curve")
         }
-        throw CashuError.cryptoError("Could not hash secret to curve")
     }
 
 }

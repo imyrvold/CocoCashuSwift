@@ -106,6 +106,15 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertEqual(hex(try ec_serialize_pubkey(&y2)), "026cdbe15362df59cd1dd3c9c11de8aedac2106eca69236ecd9fbe117af897be4f")
   }
 
+  /// The NUT-07 checkstate request identifies proofs by Y = hash_to_curve(secret);
+  /// `cashu_Y_hex` must reproduce the same NUT-00 vectors as the engine's method
+  /// (it is the same shared implementation — this pins the delegation).
+  func testProofYComputationMatchesNUT00Vectors() throws {
+    let zero = Data(repeating: 0, count: 32)
+    XCTAssertEqual(try cashu_Y_hex(secret: zero),
+                   "024cce997d3b518f739663b757deaec95bcd9473c30a14ac2fd04023a739d1a725")
+  }
+
   // MARK: - NUT-12 DLEQ verification
 
   /// Official NUT-12 "BlindSignature Verification" test vector. If this fails the

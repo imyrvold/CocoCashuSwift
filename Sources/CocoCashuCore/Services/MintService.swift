@@ -225,15 +225,21 @@ public actor MintService {
         }
         guard dtos.count == pending.count else { return }
 
+        // NUT-07 checkstate identifies proofs by Y = hash_to_curve(secret) —
+        // match the response BY Y, never positionally (a reordering mint must
+        // not finalize the wrong proof).
         let states = try await api.check(mint: mint, proofs: dtos)
-        guard states.count == pending.count else { return }
+        let stateByY = Dictionary(states.map { ($0.Y.lowercased(), $0.state) },
+                                  uniquingKeysWith: { first, _ in first })
 
         var spentIds: [ProofId] = []
         var releaseIds: [ProofId] = []
-        for (i, s) in states.enumerated() {
-            switch s.state {
-            case .spent:   spentIds.append(pending[i].id)
-            case .unspent: releaseIds.append(pending[i].id)
+        for proof in pending {
+            guard let y = try? cashu_Y_hex(secret: proof.secret),
+                  let state = stateByY[y] else { continue }
+            switch state {
+            case .spent:   spentIds.append(proof.id)
+            case .unspent: releaseIds.append(proof.id)
             case .pending: break
             }
         }

@@ -805,31 +805,42 @@ public struct RealMintAPI: MintAPI, Sendable {
         return (echoed, promises)
     }
     
+    /// NUT-07 proof-state check. The endpoint is POST /v1/checkstate and it takes
+    /// the proofs' Y values (compressed hex of hash_to_curve(secret)) — NOT the
+    /// raw proofs, and NOT /v1/check (which doesn't exist: it 404'd on every real
+    /// mint, silently breaking restore verification and pending reconciliation).
+    /// Returns states keyed by Y; callers must match by Y, never by position.
     public func check(mint: URL, proofs: [ProofDTO]) async throws -> [CheckStateDTO] {
-        let url = mint.appendingPathComponent("v1/check")
+        guard !proofs.isEmpty else { return [] }
+
+        let ys: [String] = try proofs.map { p in
+            guard let secretData = p.secret.data(using: .utf8) else {
+                throw CashuError.cryptoError("Proof secret is not valid UTF-8")
+            }
+            do {
+                return try cashu_Y_hex(secret: secretData)
+            } catch {
+                throw CashuError.cryptoError("Could not compute Y for proof")
+            }
+        }
+
+        let url = mint.appendingPathComponent("v1/checkstate")
         try Self.requireSecure(url)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        let body: [String: Any] = [
-            "proofs": proofs.map {
-                ["amount": $0.amount, "secret": $0.secret, "C": $0.C, "id": $0.id]
-            }
-        ]
-        
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["Ys": ys])
+
         let (data, response) = try await session.data(for: request)
-        
+
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw CashuError.network("Check failed with status: \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+            throw CashuError.network("Checkstate failed with status: \((response as? HTTPURLResponse)?.statusCode ?? 0)")
         }
-        
+
         struct CheckResponse: Decodable {
             let states: [CheckStateDTO]
         }
-        
+
         let decoded = try JSONDecoder().decode(CheckResponse.self, from: data)
         return decoded.states
     }
