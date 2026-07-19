@@ -123,6 +123,42 @@ public actor InMemoryMintRepository: MintRepository {
   public func fetch(by url: MintURL) async throws -> Mint? { store[url.absoluteString] }
 }
 
+/// Disk-backed mint registry: remembers every mint the wallet has interacted
+/// with, so multi-mint features (scan-all, reconcile-all, balance breakdown)
+/// don't depend on proofs happening to exist at a mint right now. Same
+/// persistence guarantees as the other file repositories.
+public actor FileMintRepository: MintRepository {
+  private let url: URL
+  private var store: [String: Mint]
+
+  public init(url: URL) {
+    self.url = url
+    if let data = try? Data(contentsOf: url),
+       let mints = try? JSONDecoder().decode([Mint].self, from: data) {
+      self.store = Dictionary(mints.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+    } else {
+      self.store = [:]
+    }
+  }
+
+  public func upsert(_ mint: Mint) async throws {
+    store[mint.id] = mint
+    persist()
+  }
+  public func fetchAll() async throws -> [Mint] { Array(store.values) }
+  public func fetch(by url: MintURL) async throws -> Mint? { store[url.absoluteString] }
+
+  private func persist() {
+    guard let data = try? JSONEncoder().encode(Array(store.values)) else { return }
+    var options: Data.WritingOptions = [.atomic]
+    #if os(iOS)
+    options.insert(.completeFileProtection)
+    #endif
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? data.write(to: url, options: options)
+  }
+}
+
 public actor InMemoryQuoteRepository: QuoteRepository {
   private var store: [QuoteId: Quote] = [:]
   public init() {}

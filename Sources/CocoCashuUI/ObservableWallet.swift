@@ -84,19 +84,64 @@ public final class ObservableWallet {
       }
     }
 }
+// MARK: - Multi-mint balances (display state derived from proofsByMint)
+
 public extension ObservableWallet {
-    /// Wrapper for the Core restoration service
+    struct MintBalance: Identifiable, Sendable {
+        public var id: String { url }
+        public let host: String
+        public let balance: Int64
+        public let url: String
+    }
+
+    /// Unspent balance summed across every mint the wallet holds proofs at.
+    var totalBalance: Int64 {
+        proofsByMint.values.reduce(0) { total, proofs in
+            total + proofs.filter { $0.state == .unspent }.map(\.amount).reduce(0, +)
+        }
+    }
+
+    /// Per-mint balances (host + sats), largest first, zero balances omitted.
+    var mintBalances: [MintBalance] {
+        proofsByMint.compactMap { (urlString, proofs) in
+            let bal = proofs.filter { $0.state == .unspent }.map(\.amount).reduce(0, +)
+            guard bal > 0 else { return nil }
+            let host = URL(string: urlString)?.host ?? urlString
+            return MintBalance(host: host, balance: bal, url: urlString)
+        }
+        .sorted { $0.balance > $1.balance }
+    }
+}
+
+// MARK: - Restore scanning
+
+public extension ObservableWallet {
+    /// Wrapper for the Core restoration service (single mint).
     @MainActor
     func scanForFunds(mint: URL, onProgress: (@Sendable (Int64) -> Void)? = nil) async throws -> Int {
-        // Use the library service we just built
         let restorer = WalletRestorationService(manager: self.manager)
-        
         let count = try await restorer.restoreFunds(mintURL: mint, progress: onProgress)
-        
-        // Refresh the UI state automatically after scanning
         await self.refreshAll()
-        
         return count
+    }
+
+    /// Scan every mint the wallet knows, plus an optional user-entered mint URL
+    /// (needed on a fresh restore, where the wallet knows only the default mint).
+    /// Throws only on an invalid/insecure extra URL; per-mint scan failures are
+    /// reported in the outcomes instead of aborting the sweep.
+    @MainActor
+    func scanAllMints(extraMintString: String? = nil) async throws -> [MintScanOutcome] {
+        var extras: [URL] = []
+        if let raw = extraMintString?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            guard let url = URL(string: raw) else {
+                throw CashuError.protocolError("'\(raw)' is not a valid mint URL")
+            }
+            try RealMintAPI.requireSecure(url)
+            extras.append(url)
+        }
+        let outcomes = await manager.scanAllMints(extra: extras)
+        await self.refreshAll()
+        return outcomes
     }
 }
 

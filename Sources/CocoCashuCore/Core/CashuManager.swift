@@ -14,6 +14,7 @@ public final class CashuManager: @unchecked Sendable {
   public let mintService: MintService
   public let blinding: BlindingEngine
   public let counterRepo: CounterRepository
+  public let mintRepo: MintRepository
   private var plugins: [CashuPlugin] = []
   public let history: HistoryService
 
@@ -29,6 +30,7 @@ public final class CashuManager: @unchecked Sendable {
     history = HistoryService(events: events)
     self.blinding = blinding
     self.counterRepo = counterRepo
+    self.mintRepo = mintRepo
     let ps = ProofService(proofs: proofRepo, events: events)
     proofService = ps
     quoteService = QuoteService(quotes: quoteRepo, events: events)

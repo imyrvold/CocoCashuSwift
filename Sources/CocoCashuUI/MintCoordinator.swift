@@ -183,6 +183,10 @@ public final class MintCoordinator {
                 let newProofs = try await blinding.unblind(signatures: signatures, for: blindedOutputs, mint: mintUrl)
 
                 try await manager.proofService.addNew(newProofs)
+                // Remember this mint: multi-mint operations (scan-all,
+                // reconcile-all, balance breakdown) must find it later even if
+                // these proofs get spent.
+                await manager.registerMint(mintUrl)
                 await manager.history.add(CashuTransaction(type: .receiveEcash, amount: amountToReceive, fee: estimatedFee, memo: "Received Ecash", status: .success))
                 manager.events.emit(.proofsUpdated(mint: mintUrl))
                 cocoLog("✅ CLAIM COMPLETE: Added \(amountToReceive) sats to wallet.")

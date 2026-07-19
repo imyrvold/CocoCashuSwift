@@ -96,6 +96,49 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertEqual(unspent.first?.secret, Data("legacy-secret".utf8))
   }
 
+  // MARK: - Multi-mint selection & registry
+
+  /// A token/melt spends from ONE mint: pick the largest balance that covers
+  /// the amount, or nothing when no single mint suffices (even if the total does).
+  func testMintSelectionPicksSingleCoveringMint() {
+    let a = URL(string: "https://cashu.cz")!
+    let b = URL(string: "https://mint.minibits.cash/Bitcoin")!
+    let balances = [(mint: a, balance: Int64(52)), (mint: b, balance: Int64(13))]
+
+    XCTAssertEqual(MintSelection.pick(covering: 13, from: balances), a, "largest covering balance wins")
+    XCTAssertEqual(MintSelection.pick(covering: 52, from: balances), a)
+    XCTAssertNil(MintSelection.pick(covering: 60, from: balances), "total (65) covers it but no single mint does")
+    XCTAssertNil(MintSelection.pick(covering: 1, from: []))
+  }
+
+  /// Mint identity ignores trailing slashes and case so the same mint written
+  /// two ways doesn't get scanned or counted twice.
+  func testMintDedupeNormalizesURLs() {
+    let urls = [
+      URL(string: "https://cashu.cz")!,
+      URL(string: "https://cashu.cz/")!,
+      URL(string: "https://CASHU.cz")!,
+      URL(string: "https://mint.minibits.cash/Bitcoin")!,
+    ]
+    XCTAssertEqual(MintSelection.dedupe(urls).count, 2)
+  }
+
+  /// The mint registry must survive a reopen (that's its whole purpose).
+  func testFileMintRepositoryRoundTrips() async throws {
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("coco-mints-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let repo = FileMintRepository(url: url)
+    try await repo.upsert(Mint(base: URL(string: "https://cashu.cz")!))
+    try await repo.upsert(Mint(base: URL(string: "https://mint.minibits.cash/Bitcoin")!))
+
+    let reopened = FileMintRepository(url: url)
+    let mints = try await reopened.fetchAll()
+    XCTAssertEqual(Set(mints.map(\.base.absoluteString)),
+                   ["https://cashu.cz", "https://mint.minibits.cash/Bitcoin"])
+  }
+
   // MARK: - BOLT11 amount decoding
 
   /// The invoice-amount preview must be exact whole sats or nil — never rounded.
