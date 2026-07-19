@@ -96,6 +96,32 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertEqual(unspent.first?.secret, Data("legacy-secret".utf8))
   }
 
+  // MARK: - BOLT11 amount decoding
+
+  /// The invoice-amount preview must be exact whole sats or nil — never rounded.
+  func testBOLT11AmountDecoding() {
+    // Real shapes from live testing: 440n = 44 sats, 240n = 24 sats.
+    XCTAssertEqual(BOLT11.amountSats(from: "lnbc440n1p49hqy3pp5zf45ruwfpt"), 44)
+    XCTAssertEqual(BOLT11.amountSats(from: "lnbc240n1pfoo"), 24)
+    // Each multiplier.
+    XCTAssertEqual(BOLT11.amountSats(from: "lnbc1m1pfoo"), 100_000)
+    XCTAssertEqual(BOLT11.amountSats(from: "lnbc26u1pfoo"), 2_600)
+    XCTAssertEqual(BOLT11.amountSats(from: "lnbc10n1pfoo"), 1)
+    XCTAssertEqual(BOLT11.amountSats(from: "lnbc10000p1pfoo"), 1)
+    // Testnet prefix.
+    XCTAssertEqual(BOLT11.amountSats(from: "lntb440n1pfoo"), 44)
+    // Fractional sats must be REJECTED, not truncated (10.5 sats ≠ 10).
+    XCTAssertNil(BOLT11.amountSats(from: "lnbc105n1pfoo"))
+    XCTAssertNil(BOLT11.amountSats(from: "lnbc12345p1pfoo"))
+    // Amountless invoice: `lnbc1<data>` — data starting with a multiplier letter
+    // must not be misread as an amount (the '1' here is the bech32 separator).
+    XCTAssertNil(BOLT11.amountSats(from: "lnbc1m5qxpqysgqcashu"))
+    XCTAssertNil(BOLT11.amountSats(from: "lnbc1p49hqy3ppfoo"))
+    // Non-invoices.
+    XCTAssertNil(BOLT11.amountSats(from: "cashuBpGF0"))
+    XCTAssertNil(BOLT11.amountSats(from: ""))
+  }
+
   // MARK: - NUT-13 counter
 
   func testInMemoryCounterReservesFromZeroAndAdvances() async throws {
