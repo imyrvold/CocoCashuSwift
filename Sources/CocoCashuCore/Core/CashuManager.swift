@@ -24,10 +24,11 @@ public final class CashuManager: @unchecked Sendable {
     quoteRepo: QuoteRepository,
     counterRepo: CounterRepository,
     api: MintAPI,
-    blinding: BlindingEngine
+    blinding: BlindingEngine,
+    historyURL: URL? = nil
   ) {
     events = EventBus()
-    history = HistoryService(events: events)
+    history = HistoryService(events: events, fileURL: historyURL)
     self.blinding = blinding
     self.counterRepo = counterRepo
     self.mintRepo = mintRepo

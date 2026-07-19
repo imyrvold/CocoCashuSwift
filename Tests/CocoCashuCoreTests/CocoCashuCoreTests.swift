@@ -96,6 +96,39 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertEqual(unspent.first?.secret, Data("legacy-secret".utf8))
   }
 
+  // MARK: - WalletStorage layout & resets
+
+  /// The reset semantics are security-relevant: a full reset must remove every
+  /// wallet file (history leaks activity), while an imported-seed reset must
+  /// keep the mint registry (mints aren't seed-specific — the post-import scan
+  /// needs them) but remove everything derived from the old seed.
+  func testWalletStorageResetSemantics() throws {
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("coco-storage-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let storage = WalletStorage(directory: dir)
+    let fm = FileManager.default
+    for url in [storage.proofsURL, storage.countersURL, storage.historyURL, storage.mintsURL] {
+      try Data("[]".utf8).write(to: url)
+    }
+
+    storage.clearBalance()
+    XCTAssertFalse(fm.fileExists(atPath: storage.proofsURL.path), "clearBalance removes proofs")
+    XCTAssertTrue(fm.fileExists(atPath: storage.countersURL.path), "clearBalance keeps counters")
+
+    try Data("[]".utf8).write(to: storage.proofsURL)
+    storage.resetForImportedSeed()
+    XCTAssertFalse(fm.fileExists(atPath: storage.proofsURL.path))
+    XCTAssertFalse(fm.fileExists(atPath: storage.countersURL.path))
+    XCTAssertFalse(fm.fileExists(atPath: storage.historyURL.path))
+    XCTAssertTrue(fm.fileExists(atPath: storage.mintsURL.path), "import reset keeps the mint registry")
+
+    try Data("[]".utf8).write(to: storage.proofsURL)
+    storage.resetForNewSeed()
+    XCTAssertFalse(fm.fileExists(atPath: storage.mintsURL.path), "full reset removes the mint registry too")
+  }
+
   // MARK: - Multi-mint selection & registry
 
   /// A token/melt spends from ONE mint: pick the largest balance that covers

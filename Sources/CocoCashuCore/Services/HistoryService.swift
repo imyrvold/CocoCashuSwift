@@ -7,24 +7,11 @@ public actor HistoryService {
     // Simple file persistence for the demo
     private let fileURL: URL
 
-    public init(events: EventBus) {
+    /// `fileURL` nil falls back to the standard wallet directory — pass
+    /// `WalletStorage.historyURL` so all wallet files share one layout.
+    public init(events: EventBus, fileURL: URL? = nil) {
         self.events = events
-        
-        // 1. Determine the URL logic first
-        let targetURL: URL
-        if let appSupport = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true) {
-            let dir = appSupport.appendingPathComponent("CocoCashuWallet")
-            // It is safe to try creating the directory here
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
-            targetURL = dir.appendingPathComponent("history.json")
-        } else {
-            // Fallback
-            targetURL = FileManager.default.temporaryDirectory.appendingPathComponent("history.json")
-        }
-        
-        // 2. Assign to self.fileURL exactly once
-        self.fileURL = targetURL
-        
+        self.fileURL = fileURL ?? WalletStorage.standard().historyURL
         Task { await load() }
     }
     
