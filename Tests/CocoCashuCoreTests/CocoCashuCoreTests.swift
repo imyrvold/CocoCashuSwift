@@ -479,6 +479,51 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertEqual(decoded.proofs[2].C, "0273129c5719e599379a974a626363c333c56cafc0e6d01abe46d5808280789c63")
   }
 
+  /// Round-trip: serializing proofs to cashuB then decoding must reproduce them.
+  func testTokenV4SerializeRoundTrips() throws {
+    let mint = URL(string: "https://mint.test")!
+    let proofs = [
+      Proof(amount: 2, mint: mint, secret: Data("secret-two".utf8),
+            C: "0244538319de485d55bed3b29a642bee5879375ab9e7a620e11e48ba482421f3cf",
+            keysetId: "00ad268c4d1f5826"),
+      Proof(amount: 8, mint: mint, secret: Data("secret-eight".utf8),
+            C: "0273129c5719e599379a974a626363c333c56cafc0e6d01abe46d5808280789c63",
+            keysetId: "00ad268c4d1f5826"),
+    ]
+    let token = try TokenV4Helper.serialize(proofs, mint: mint, memo: "hi")
+    XCTAssertTrue(token.hasPrefix("cashuB"))
+
+    let decoded = try TokenV4Helper.deserialize(token)
+    XCTAssertEqual(decoded.mint, "https://mint.test")
+    XCTAssertEqual(decoded.unit, "sat")
+    XCTAssertEqual(decoded.memo, "hi")
+    XCTAssertEqual(decoded.proofs.map(\.amount), [2, 8])
+    XCTAssertEqual(decoded.proofs.map(\.secret), ["secret-two", "secret-eight"])
+    XCTAssertEqual(decoded.proofs.map(\.keysetId), ["00ad268c4d1f5826", "00ad268c4d1f5826"])
+    XCTAssertEqual(decoded.proofs.map(\.C),
+      ["0244538319de485d55bed3b29a642bee5879375ab9e7a620e11e48ba482421f3cf",
+       "0273129c5719e599379a974a626363c333c56cafc0e6d01abe46d5808280789c63"])
+  }
+
+  /// Our CBOR encoder must produce byte-exactly the official NUT-00 single-keyset
+  /// vector, so tokens we emit are decodable by every other Cashu wallet.
+  func testTokenV4SerializeMatchesOfficialVector() throws {
+    let mint = URL(string: "http://localhost:3338")!
+    let proof = Proof(
+      amount: 1, mint: mint,
+      secret: Data("9a6dbb847bd232ba76db0df197216b29d3b8cc14553cd27827fc1cc942fedb4e".utf8),
+      C: "038618543ffb6b8695df4ad4babcde92a34a96bdcd97dcee0d7ccf98d472126792",
+      keysetId: "00ad268c4d1f5826")
+    let token = try TokenV4Helper.serialize([proof], mint: mint, memo: "Thank you")
+    // We emit unpadded base64url (the modern Cashu convention); the official
+    // vector string carries base64 '=' padding. Compare with padding stripped —
+    // the CBOR payload bytes are then byte-for-byte identical, which is the real
+    // interop guarantee. (The deserializer accepts both forms.)
+    let official = "cashuBpGF0gaJhaUgArSaMTR9YJmFwgaNhYQFhc3hAOWE2ZGJiODQ3YmQyMzJiYTc2ZGIwZGYxOTcyMTZiMjlkM2I4Y2MxNDU1M2NkMjc4MjdmYzFjYzk0MmZlZGI0ZWFjWCEDhhhUP_trhpXfStS6vN6So0qWvc2X3O4NfM-Y1HISZ5JhZGlUaGFuayB5b3VhbXVodHRwOi8vbG9jYWxob3N0OjMzMzhhdWNzYXQ="
+      .replacingOccurrences(of: "=", with: "")
+    XCTAssertEqual(token, official)
+  }
+
   /// Malformed cashuB input must throw, not crash: truncated CBOR, garbage
   /// base64, wrong shape, and (importantly) a V3 JSON payload behind a cashuB prefix.
   func testTokenV4RejectsMalformedInput() {

@@ -251,7 +251,7 @@ public actor MintService {
     
     /// Create a token string for a specific amount.
     /// This effectively "spends" the funds from your wallet and returns them as a token string.
-    public func createToken(amount: Int64, from mint: MintURL, memo: String? = nil) async throws -> String {
+    public func createToken(amount: Int64, from mint: MintURL, memo: String? = nil, tokenVersion: TokenVersion = .v3) async throws -> String {
         // NUT-02: Fetch keyset to get dynamic fee info — from the mint we are
         // actually spending at, not the default mint (their fees can differ).
         let keyset = try await api.fetchKeyset(mint: mint)
@@ -338,14 +338,14 @@ public actor MintService {
             status: .success
         ))
 
-        return try TokenHelper.serialize(tokenProofs, mint: mint, memo: memo)
+        return try TokenHelper.serialize(tokenProofs, mint: mint, memo: memo, version: tokenVersion)
     }
-    
+
     /// Swaps specific proofs for a target amount (to send) + change.
     /// Returns: (change: [Proof], token: String)
     /// - change: The proofs you keep (put back in wallet).
     /// - token: The serialized token string you give to the recipient.
-    public func swap(proofs inputProofs: [Proof], amount: Int64, mint: MintURL) async throws -> (change: [Proof], token: String) {
+    public func swap(proofs inputProofs: [Proof], amount: Int64, mint: MintURL, tokenVersion: TokenVersion = .v3) async throws -> (change: [Proof], token: String) {
         
         // 1. Calculate Input Total
         let totalInput = inputProofs.map(\.amount).reduce(0, +)
@@ -394,7 +394,7 @@ public actor MintService {
 
         await history.add(CashuTransaction(type: .sendEcash, amount: amount, fee: fee, memo: "Sent Ecash", status: .success))
 
-        let tokenString = try TokenHelper.serialize(tokenProofs, mint: mint)
+        let tokenString = try TokenHelper.serialize(tokenProofs, mint: mint, version: tokenVersion)
 
         return (change: changeProofs, token: tokenString)
     }

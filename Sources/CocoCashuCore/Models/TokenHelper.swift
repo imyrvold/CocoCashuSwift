@@ -22,7 +22,23 @@ public struct TokenV3: Codable {
     public let memo: String?
 }
 
+/// Which on-the-wire token format to emit. V3 (`cashuA`, base64 JSON) is the
+/// most broadly compatible; V4 (`cashuB`, CBOR) is compact — better for NFC
+/// cards (limited capacity) and smaller QR codes. All modern wallets read both.
+public enum TokenVersion: Sendable {
+    case v3
+    case v4
+}
+
 public enum TokenHelper {
+    /// Serialize using the requested format. Proofs must belong to one mint.
+    public static func serialize(_ proofs: [Proof], mint: MintURL, memo: String? = nil, version: TokenVersion) throws -> String {
+        switch version {
+        case .v3: return try serialize(proofs, mint: mint, memo: memo)
+        case .v4: return try TokenV4Helper.serialize(proofs, mint: mint, memo: memo)
+        }
+    }
+
     public static func serialize(_ proofs: [Proof], mint: MintURL, memo: String? = nil) throws -> String {
         let tokenProofs: [TokenV3.TokenProof] = try proofs.map { p in
             guard let secretString = String(data: p.secret, encoding: .utf8), !secretString.isEmpty else {

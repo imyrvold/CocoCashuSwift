@@ -129,6 +129,49 @@ struct CBORDecoder {
     }
 }
 
+// MARK: - Minimal CBOR encoder (for producing cashuB tokens)
+//
+// Counterpart to the decoder above, covering the same subset. Maps are encoded
+// from ordered key/value pairs so output is deterministic and matches the field
+// order other Cashu implementations emit (t, d, m, u / i, p / a, s, c).
+
+struct CBOREncoder {
+    private(set) var data = Data()
+
+    private mutating func writeHeader(major: UInt8, argument: UInt64) {
+        let majorBits = major << 5
+        switch argument {
+        case 0...23:
+            data.append(majorBits | UInt8(argument))
+        case 24...UInt64(UInt8.max):
+            data.append(majorBits | 24)
+            data.append(UInt8(argument))
+        case (UInt64(UInt8.max) + 1)...UInt64(UInt16.max):
+            data.append(majorBits | 25)
+            withUnsafeBytes(of: UInt16(argument).bigEndian) { data.append(contentsOf: $0) }
+        case (UInt64(UInt16.max) + 1)...UInt64(UInt32.max):
+            data.append(majorBits | 26)
+            withUnsafeBytes(of: UInt32(argument).bigEndian) { data.append(contentsOf: $0) }
+        default:
+            data.append(majorBits | 27)
+            withUnsafeBytes(of: argument.bigEndian) { data.append(contentsOf: $0) }
+        }
+    }
+
+    mutating func appendUnsigned(_ value: UInt64) { writeHeader(major: 0, argument: value) }
+    mutating func appendBytes(_ bytes: Data) {
+        writeHeader(major: 2, argument: UInt64(bytes.count))
+        data.append(bytes)
+    }
+    mutating func appendText(_ text: String) {
+        let utf8 = Data(text.utf8)
+        writeHeader(major: 3, argument: UInt64(utf8.count))
+        data.append(utf8)
+    }
+    mutating func appendArrayHeader(count: Int) { writeHeader(major: 4, argument: UInt64(count)) }
+    mutating func appendMapHeader(count: Int) { writeHeader(major: 5, argument: UInt64(count)) }
+}
+
 // MARK: - NUT-00 V4 token
 
 /// Decoded V4 (cashuB) token: `{m: mint, u: unit, d?: memo, t: [{i: keyset-id
@@ -148,6 +191,62 @@ public struct TokenV4: Sendable {
 }
 
 public enum TokenV4Helper {
+    /// Serialize proofs to a `cashuB…` V4 (CBOR) token. All proofs must belong to
+    /// one mint (V4's structure is single-mint). Compact output — smaller QR
+    /// codes and a better fit for NFC-card capacity than V3's base64 JSON — with
+    /// the secret emitted as its UTF-8 string per NUT-00 (a proof whose secret
+    /// isn't UTF-8 is rejected rather than written into an unredeemable token).
+    public static func serialize(_ proofs: [Proof], mint: MintURL, unit: String = "sat", memo: String? = nil) throws -> String {
+        guard !proofs.isEmpty else { throw CashuError.invalidToken }
+
+        // Group proofs by keyset id → the `t` array's entries.
+        var order: [String] = []
+        var byKeyset: [String: [Proof]] = [:]
+        for p in proofs {
+            if byKeyset[p.keysetId] == nil { order.append(p.keysetId) }
+            byKeyset[p.keysetId, default: []].append(p)
+        }
+
+        var enc = CBOREncoder()
+        enc.appendMapHeader(count: memo == nil ? 3 : 4)   // root: t, (d), m, u
+
+        enc.appendText("t")
+        enc.appendArrayHeader(count: order.count)
+        for keysetId in order {
+            guard let idBytes = Data(hex: keysetId) else {
+                throw CashuError.protocolError("Keyset ID '\(keysetId)' is not hex; cannot serialize as V4")
+            }
+            let group = byKeyset[keysetId] ?? []
+            enc.appendMapHeader(count: 2)                 // { i, p }
+            enc.appendText("i"); enc.appendBytes(idBytes)
+            enc.appendText("p")
+            enc.appendArrayHeader(count: group.count)
+            for p in group {
+                guard let secret = String(data: p.secret, encoding: .utf8), !secret.isEmpty else {
+                    throw CashuError.protocolError("Proof secret is not valid UTF-8; cannot serialize as V4")
+                }
+                guard let cBytes = Data(hex: p.C) else {
+                    throw CashuError.protocolError("Proof signature is not hex; cannot serialize as V4")
+                }
+                guard p.amount >= 0 else { throw CashuError.invalidToken }
+                enc.appendMapHeader(count: 3)             // { a, s, c }
+                enc.appendText("a"); enc.appendUnsigned(UInt64(p.amount))
+                enc.appendText("s"); enc.appendText(secret)
+                enc.appendText("c"); enc.appendBytes(cBytes)
+            }
+        }
+
+        if let memo { enc.appendText("d"); enc.appendText(memo) }
+        enc.appendText("m"); enc.appendText(mint.absoluteString)
+        enc.appendText("u"); enc.appendText(unit)
+
+        let b64 = enc.data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "cashuB" + b64
+    }
+
     /// Deserialize a `cashuB…` string. Only decoding/shape errors throw
     /// `CashuError.invalidToken`; amount validation is left to the caller so it
     /// can apply the same policy as V3 tokens.
