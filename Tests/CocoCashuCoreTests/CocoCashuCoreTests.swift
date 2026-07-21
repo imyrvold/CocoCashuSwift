@@ -129,6 +129,99 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertFalse(fm.fileExists(atPath: storage.mintsURL.path), "full reset removes the mint registry too")
   }
 
+  // MARK: - BC-UR (animated QR) decoding
+
+  /// Reference vector: crc32("Wolf") from the MUR implementation guide.
+  func testBCURCRC32MatchesReference() {
+    XCTAssertEqual(CRC32.checksum(Data("Wolf".utf8)), 0x598c84dc)
+  }
+
+  /// Reference vector: the Xoshiro256** stream seeded with "Wolf" (MUR guide).
+  /// If this fails, mixed fountain parts would reassemble into garbage.
+  func testBCURXoshiroMatchesReference() {
+    let rng = Xoshiro256(string: "Wolf")
+    XCTAssertEqual(rng.nextData(count: 10).hexString, "916ec65cf77cadf55cd7")
+  }
+
+  /// Reference vector: part CBOR from the MUR guide —
+  /// [12, 8, 100, 0x12345678, h'0105030305'] == 850c0818641a12345678450105030305.
+  func testBCURPartCBORMatchesReference() {
+    var enc = CBOREncoder()
+    enc.appendArrayHeader(count: 5)
+    enc.appendUnsigned(12)
+    enc.appendUnsigned(8)
+    enc.appendUnsigned(100)
+    enc.appendUnsigned(0x12345678)
+    enc.appendBytes(Data([1, 5, 3, 3, 5]))
+    XCTAssertEqual(enc.data.hexString, "850c0818641a12345678450105030305")
+  }
+
+  /// Reference vector: minimal bytewords of [0,1,2,128,255] (BCR-2020-012).
+  func testBCURBytewordsMatchesReference() throws {
+    let data = Data([0, 1, 2, 128, 255])
+    XCTAssertEqual(Bytewords.encodeMinimal(data), "aeadaolazmjendeoti")
+    XCTAssertEqual(try Bytewords.decodeMinimal("aeadaolazmjendeoti"), data)
+    // A flipped character must fail the CRC.
+    XCTAssertThrowsError(try Bytewords.decodeMinimal("aeadaolazmjendeota"))
+  }
+
+  /// A REAL frame captured from the Cashu app (5-sat token, frame 42 of 5).
+  /// Proves our bytewords + CRC + part-CBOR pipeline against another
+  /// implementation's live output.
+  func testBCURParsesRealCashuAppFrame() throws {
+    let frame = "ur:bytes/42-5/lpcsdrahcfaxsncypreyfyzmhdsrhtftkojpeoatfgfglbiadrjtkoglgdahbyiyenjnjyjpdtkibghphsjskifydphscsjsknfeflgwfggabagtbbhdgtfrgukphlhygaisgsinfdkggmidathkktkojohygtfdhlfzktindwhthsadfydsiaaafzfldsgtgeeygrjkflfejsktbgjlfmhsjlbnfxgrhkgridkieoftdlchbkchjokegdgujtbeaxidisdpjpimjkcxhegskifzhdcwihihimgwknhdecetjsbdfreyidgyhffpeekikiisfpkkjogagsjegtflkojejpdkktgrdthgceahhdbadegyasgyktcwhldpaagacmfejpfdhebzfdeegsfpghhheckkhegabsmyuocyhl"
+    let part = try XCTUnwrap(URPart.parse(frame))
+    XCTAssertEqual(part.type, "bytes")
+    XCTAssertEqual(part.seqNum, 42)
+    XCTAssertEqual(part.seqLen, 5)
+    XCTAssertGreaterThan(part.messageLen, 0)
+    XCTAssertEqual(part.data.count * 5 >= part.messageLen, true, "5 fragments must cover the message")
+
+    // And the decoder must give the honest guidance when this single frame is
+    // pasted rather than scanned.
+    XCTAssertThrowsError(try URDecoder.decodeSinglePart(frame)) { error in
+      guard case BCURError.singleFrameOfMultipart(let n, let len) = error else {
+        return XCTFail("wrong error: \(error)")
+      }
+      XCTAssertEqual(n, 42); XCTAssertEqual(len, 5)
+    }
+  }
+
+  /// Full fountain round trip, joining MID-STREAM: feed only frames 3·seqLen
+  /// onward (all rateless/mixed parts, none of the simple ones), which is
+  /// exactly the animated-QR reality. Completing proves the RNG, sampler,
+  /// shuffle, and XOR reduction are self-consistent end to end.
+  func testBCURFountainDecodesFromMidStream() throws {
+    let token = "cashuBo2F0gaJhaUgA_9SLj17PgGFwgaNhYQFhc3hAYWNj" + String(repeating: "x", count: 400)
+    let payload = Data(token.utf8)
+    let encoder = UREncoder(message: UREncoder.makeMessage(payload: payload), maxFragmentLen: 50)
+    XCTAssertGreaterThan(encoder.seqLen, 3, "need a genuinely multi-part message")
+
+    // Skip the first cycles entirely (frames 1..3·seqLen are discarded).
+    for _ in 0..<(3 * encoder.seqLen) { _ = encoder.nextPart() }
+
+    let decoder = URDecoder()
+    var frames = 0
+    while !decoder.isComplete {
+      frames += 1
+      XCTAssertLessThan(frames, 200, "decoder failed to converge")
+      try decoder.receivePart(encoder.nextPart())
+    }
+    XCTAssertEqual(decoder.result, payload)
+    XCTAssertEqual(String(data: try XCTUnwrap(decoder.result), encoding: .utf8)?.hasPrefix("cashuB"), true)
+  }
+
+  /// Single-part UR round trip (small payloads fit one frame).
+  func testBCURSinglePartRoundTrip() throws {
+    let payload = Data("cashuAeyJ0b2tlbiI6W119".utf8)
+    let single = "ur:bytes/" + Bytewords.encodeMinimal(UREncoder.makeMessage(payload: payload))
+    XCTAssertEqual(try URDecoder.decodeSinglePart(single), payload)
+
+    let decoder = URDecoder()
+    try decoder.receivePart(single)
+    XCTAssertEqual(decoder.result, payload)
+  }
+
   // MARK: - NUT-18 payment requests
 
   /// Official NUT-18 test vectors (encoded strings verbatim from the spec).
