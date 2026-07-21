@@ -211,6 +211,22 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertEqual(String(data: try XCTUnwrap(decoder.result), encoding: .utf8)?.hasPrefix("cashuB"), true)
   }
 
+  /// The public payload convenience init (used by the app's animated send view)
+  /// must produce a stream the decoder reassembles to the same payload.
+  func testBCUREncoderPayloadInitRoundTrips() throws {
+    let payload = Data(("cashuB" + String(repeating: "y", count: 700)).utf8)
+    let encoder = UREncoder(payload: payload, maxFragmentLen: 150)
+    XCTAssertGreaterThan(encoder.seqLen, 1)
+    let decoder = URDecoder()
+    var frames = 0
+    while !decoder.isComplete {
+      frames += 1
+      XCTAssertLessThan(frames, 100)
+      try decoder.receivePart(encoder.nextPart())
+    }
+    XCTAssertEqual(decoder.result, payload)
+  }
+
   /// Single-part UR round trip (small payloads fit one frame).
   func testBCURSinglePartRoundTrip() throws {
     let payload = Data("cashuAeyJ0b2tlbiI6W119".utf8)

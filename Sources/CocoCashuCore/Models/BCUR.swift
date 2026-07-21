@@ -453,9 +453,13 @@ public final class URDecoder {
     }
 }
 
-// MARK: - UREncoder (for tests and future animated-QR sending)
+// MARK: - UREncoder (animated-QR sending)
 
-final class UREncoder {
+/// Emits an endless stream of `ur:bytes` frames for one message. Display them
+/// on a timer (~5 fps) as an animated QR; any BC-UR-capable wallet can join the
+/// stream at ANY point and reassemble (fountain coding). Use for payloads too
+/// large to scan reliably as a single static QR.
+public final class UREncoder {
     private let fragments: [Data]
     private let messageLen: Int
     private let checksum: UInt32
@@ -468,16 +472,22 @@ final class UREncoder {
         self.checksum = CRC32.checksum(message)
     }
 
-    var seqLen: Int { fragments.count }
+    /// Encode a raw payload (e.g. a token string's UTF-8 bytes): wraps it in the
+    /// `ur:bytes` message CBOR and fragments it.
+    public convenience init(payload: Data, maxFragmentLen: Int = 100) {
+        self.init(message: Self.makeMessage(payload: payload), maxFragmentLen: maxFragmentLen)
+    }
+
+    public var seqLen: Int { fragments.count }
 
     /// Wrap a payload in the `ur:bytes` message CBOR (a byte string).
-    static func makeMessage(payload: Data) -> Data {
+    public static func makeMessage(payload: Data) -> Data {
         var enc = CBOREncoder()
         enc.appendBytes(payload)
         return enc.data
     }
 
-    func nextPart() -> String {
+    public func nextPart() -> String {
         seqNum &+= 1
         let indexes = FountainMath.chooseFragments(seqNum: seqNum, seqLen: seqLen, checksum: checksum)
         var mixed = Data(repeating: 0, count: fragments[0].count)
