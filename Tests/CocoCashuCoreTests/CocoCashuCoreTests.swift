@@ -129,6 +129,61 @@ final class CocoCashuCoreTests: XCTestCase {
     XCTAssertFalse(fm.fileExists(atPath: storage.mintsURL.path), "full reset removes the mint registry too")
   }
 
+  // MARK: - NUT-18 payment requests
+
+  /// Official NUT-18 test vectors (encoded strings verbatim from the spec).
+  private static let nut18Vectors = [
+    "creqApWF0gaNhdGVub3N0cmFheKlucHJvZmlsZTFxeTI4d3VtbjhnaGo3dW45ZDNzaGp0bnl2OWtoMnVld2Q5aHN6OW1od2RlbjV0ZTB3ZmprY2N0ZTljdXJ4dmVuOWVlaHFjdHJ2NWhzenJ0aHdkZW41dGUwZGVoaHh0bnZkYWtxcWd5ZGFxeTdjdXJrNDM5eWtwdGt5c3Y3dWRoZGh1NjhzdWNtMjk1YWtxZWZkZWhrZjBkNDk1Y3d1bmw1YWeBgmFuYjE3YWloYjdhOTAxNzZhYQphdWNzYXRhbYF4Imh0dHBzOi8vbm9mZWVzLnRlc3RudXQuY2FzaHUuc3BhY2U=",
+    "creqAo2FpaDdmNGEyYjM5YXVjc2F0YW2BeBhodHRwczovL21pbnQuZXhhbXBsZS5jb20=",
+  ]
+
+  /// The minimal vector is fully known: decode must yield exactly these fields.
+  func testNUT18DecodesMinimalVector() throws {
+    let req = try PaymentRequest.decode(Self.nut18Vectors[1])
+    XCTAssertEqual(req.id, "7f4a2b39")
+    XCTAssertEqual(req.unit, "sat")
+    XCTAssertEqual(req.mints, ["https://mint.example.com"])
+    XCTAssertNil(req.amount)
+    XCTAssertTrue(req.transports.isEmpty)
+  }
+
+  /// The basic vector carries an amount and a nostr transport.
+  func testNUT18DecodesBasicVector() throws {
+    let req = try PaymentRequest.decode(Self.nut18Vectors[0])
+    XCTAssertEqual(req.id, "b7a90176")
+    XCTAssertEqual(req.amount, 10)
+    XCTAssertEqual(req.unit, "sat")
+    XCTAssertEqual(req.mints.count, 1)
+    XCTAssertEqual(req.transports.first?.type, "nostr")
+  }
+
+  /// Decode→encode→decode must be stable for every official vector (proves the
+  /// encoder and decoder agree on the whole structure, transports included).
+  func testNUT18RoundTripStability() throws {
+    for vector in Self.nut18Vectors {
+      let a = try PaymentRequest.decode(vector)
+      let reencoded = try a.encode()
+      let b = try PaymentRequest.decode(reencoded)
+      XCTAssertEqual(a, b, "round trip changed the request")
+    }
+  }
+
+  /// A wallet-built request must round-trip through the codec unchanged.
+  func testNUT18EncodeRoundTrip() throws {
+    let req = PaymentRequest(
+      id: "abc123", amount: 21, unit: "sat",
+      mints: ["https://mint.example.com"], description: "coffee"
+    )
+    let decoded = try PaymentRequest.decode(try req.encode())
+    XCTAssertEqual(decoded, req)
+  }
+
+  func testNUT18RejectsGarbage() {
+    for bad in ["", "creqA", "creqA!!!!", "cashuAeyJ0b2tlbiI6W119", "creqAAAAA"] {
+      XCTAssertThrowsError(try PaymentRequest.decode(bad), "must reject: \(bad)")
+    }
+  }
+
   // MARK: - Multi-mint selection & registry
 
   /// A token/melt spends from ONE mint: pick the largest balance that covers
